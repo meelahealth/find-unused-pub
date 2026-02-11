@@ -270,6 +270,47 @@ fn theme() -> &'static ThemeColors {
     &themes[idx.min(themes.len() - 1)]
 }
 
+/// Pick two maximally contrasting colors from the theme swatch and a blended midpoint.
+fn eq_colors() -> (Color, Color, Color) {
+    let t = theme();
+    let candidates = &t.swatch;
+
+    fn rgb(c: &Color) -> (i32, i32, i32) {
+        match c {
+            Color::Rgb(r, g, b) => (*r as i32, *g as i32, *b as i32),
+            _ => (128, 128, 128),
+        }
+    }
+    fn dist_sq(a: &Color, b: &Color) -> i64 {
+        let (ar, ag, ab) = rgb(a);
+        let (br, bg, bb) = rgb(b);
+        let dr = (ar - br) as i64;
+        let dg = (ag - bg) as i64;
+        let db = (ab - bb) as i64;
+        dr * dr + dg * dg + db * db
+    }
+
+    let mut best = (0usize, 1usize, 0i64);
+    for i in 0..candidates.len() {
+        for j in (i + 1)..candidates.len() {
+            let d = dist_sq(&candidates[i], &candidates[j]);
+            if d > best.2 {
+                best = (i, j, d);
+            }
+        }
+    }
+    let a = candidates[best.0];
+    let b = candidates[best.1];
+    let (ar, ag, ab) = rgb(&a);
+    let (br, bg, bb) = rgb(&b);
+    let blend = Color::Rgb(
+        ((ar + br) / 2) as u8,
+        ((ag + bg) / 2) as u8,
+        ((ab + bb) / 2) as u8,
+    );
+    (a, b, blend)
+}
+
 /// Multi-row dual-wave braille visualizer (oscilloscope style).
 /// Two waveforms rendered in contrasting colors; where they overlap the accent color is used.
 fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
@@ -280,7 +321,6 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
         [0x40, 0x80],
     ];
 
-    let t = theme();
     let tf = tick as f64;
     let total_rows = (height as usize) * 4;
     let max_row = total_rows.saturating_sub(1);
@@ -347,9 +387,7 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
         })
         .collect();
 
-    let color_a = t.tertiary;
-    let color_b = t.error;
-    let color_both = t.accent;
+    let (color_a, color_b, color_both) = eq_colors();
 
     let lines: Vec<Line<'a>> = (0..height as usize)
         .map(|cell_row| {
