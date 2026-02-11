@@ -3,17 +3,38 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::process::Command;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, NaiveDate, Utc};
 use clap::Parser;
-use dialoguer::Select;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::ExecutableCommand;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use ignore::WalkBuilder;
 use owo_colors::OwoColorize;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::Terminal;
 use rusqlite::Connection;
+
+// ---------------------------------------------------------------------------
+// Catppuccin Mocha theme
+// ---------------------------------------------------------------------------
+
+const MOCHA: &catppuccin::FlavorColors = &catppuccin::PALETTE.mocha.colors;
+
+/// Convert a catppuccin color to ratatui Color.
+fn ctp(color: catppuccin::Color) -> Color {
+    color.into()
+}
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -41,11 +62,11 @@ struct Args {
     #[arg(long)]
     fix: bool,
 
-    /// Interactively review unused items (fix / whitelist / skip)
+    /// Interactively review unused items (fix / allowlist / skip)
     #[arg(long)]
     review_unused: bool,
 
-    /// Interactively review crate-internal items (fix / whitelist / skip)
+    /// Interactively review crate-internal items (fix / allowlist / skip)
     #[arg(long)]
     review_crate_internal: bool,
 
@@ -90,12 +111,309 @@ struct UnusedSymbol {
     symbol: PubSymbol,
     kind: SymbolKind,
     crate_name: String,
+    /// Reference locations for crate-internal items (excludes definition line).
+    internal_refs: Vec<(PathBuf, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    Graphql,
+    Orm,
 }
 
 struct CrateResult {
     crate_name: String,
     items_found: usize,
     unused: Vec<UnusedSymbol>,
+    /// Symbols skipped with the reason they were skipped.
+    skipped: Vec<(String, SkipReason)>,
+}
+
+enum ScanMessage {
+    Stage(String),
+    Done(CrateResult),
+}
+
+#[derive(Debug, Clone)]
+struct GitBlameInfo {
+    short_hash: String,
+    author: String,
+    date: String,
+    age: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitLogEntry {
+    short_hash: String,
+    author: String,
+    date: String,
+    age: String,
+    subject: String,
+    patch: String,
+    /// All +/- lines from the full diff that mention the symbol.
+    diff_matches: Vec<String>,
+    /// True if the symbol only appears in definition-like lines (fn, struct, etc.),
+    /// never in usage context.
+    definition_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GitInfo {
+    blame: Option<GitBlameInfo>,
+    log_entry: Option<GitLogEntry>,
+}
+
+#[derive(Clone)]
+enum GitLoadState {
+    Pending,
+    RunningBlame,
+    RunningLogS,
+    Done(GitInfo),
+}
+
+#[derive(Clone)]
+enum ReviewAction {
+    Fix,
+    Allowlist,
+    Skip,
+}
+
+/// Tracks background scan progress when the TUI starts before scanning completes.
+struct ScanState {
+    crate_names: Vec<String>,
+    /// Current stage description per crate (shown while scanning).
+    stages: Vec<String>,
+    /// Indexed by crate order; `None` means still scanning.
+    completed: Vec<Option<CrateResult>>,
+    rx: mpsc::Receiver<(usize, ScanMessage)>,
+    start: Instant,
+}
+
+// ---------------------------------------------------------------------------
+// Git info
+// ---------------------------------------------------------------------------
+
+fn git_blame(file: &Path, line: usize, workspace_root: &Path) -> Option<GitBlameInfo> {
+    let output = Command::new("git")
+        .args(["blame", &format!("-L{line},{line}"), "--porcelain"])
+        .arg(file)
+        .current_dir(workspace_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut hash = None;
+    let mut author = None;
+    let mut epoch = None;
+    let mut summary = None;
+    for blame_line in stdout.lines() {
+        if hash.is_none() {
+            // First line: "hash orig_line final_line num_lines"
+            hash = blame_line.split_whitespace().next().map(|h| {
+                if h.len() >= 7 { h[..7].to_string() } else { h.to_string() }
+            });
+        } else if let Some(a) = blame_line.strip_prefix("author ") {
+            author = Some(a.to_string());
+        } else if let Some(t) = blame_line.strip_prefix("author-time ") {
+            epoch = t.trim().parse::<i64>().ok();
+        } else if let Some(s) = blame_line.strip_prefix("summary ") {
+            summary = Some(s.to_string());
+        }
+    }
+    let dt = DateTime::from_timestamp(epoch?, 0)?;
+    let date = dt.format("%Y-%m-%d").to_string();
+    let age = relative_age(dt);
+    Some(GitBlameInfo {
+        short_hash: hash?,
+        author: author.unwrap_or_default(),
+        date,
+        age,
+        summary: summary.unwrap_or_default(),
+    })
+}
+
+fn relative_age(dt: DateTime<Utc>) -> String {
+    let days = (Utc::now() - dt).num_days();
+    if days < 1 {
+        "today".to_string()
+    } else if days == 1 {
+        "yesterday".to_string()
+    } else if days < 30 {
+        format!("{days} days ago")
+    } else if days < 365 {
+        let months = days / 30;
+        if months == 1 { "1 month ago".to_string() } else { format!("{months} months ago") }
+    } else {
+        let years = days / 365;
+        if years == 1 { "1 year ago".to_string() } else { format!("{years} years ago") }
+    }
+}
+
+fn git_log_s(symbol: &str, workspace_root: &Path) -> Option<GitLogEntry> {
+    let output = Command::new("git")
+        .args([
+            "log",
+            "-1",
+            "-S",
+            symbol,
+            "--format=%h|%an|%ad|%s",
+            "--date=short",
+            "--patch",
+            "--",
+            "**/*.rs",
+        ])
+        .current_dir(workspace_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let header = lines.next()?;
+    if header.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = header.splitn(4, '|').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let raw_patch: String = lines.collect::<Vec<_>>().join("\n");
+    let patch = filter_patch_for_symbol(&raw_patch, symbol);
+
+    // Grep the full diff for the symbol — like `rg "symbol" diff_output`
+    let diff_matches: Vec<String> = raw_patch
+        .lines()
+        .filter(|l| {
+            (l.starts_with('+') || l.starts_with('-'))
+                && !l.starts_with("+++")
+                && !l.starts_with("---")
+                && l.contains(symbol)
+        })
+        .map(|l| l.to_string())
+        .collect();
+
+    let definition_only = !diff_matches.is_empty()
+        && diff_matches.iter().all(|l| is_definition_line(l, symbol));
+
+    let date_str = parts[2].to_string();
+    let age = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| relative_age(dt.and_utc()))
+        .unwrap_or_default();
+    Some(GitLogEntry {
+        short_hash: parts[0].to_string(),
+        author: parts[1].to_string(),
+        date: date_str,
+        age,
+        subject: parts[3].to_string(),
+        patch,
+        diff_matches,
+        definition_only,
+    })
+}
+
+/// Filter a full commit patch down to only hunks where a +/- line contains the symbol.
+fn filter_patch_for_symbol(patch: &str, symbol: &str) -> String {
+    let mut result = Vec::new();
+    let mut current_file_header: Vec<&str> = Vec::new();
+    let mut current_hunk: Vec<&str> = Vec::new();
+    let mut hunk_matches = false;
+    let mut file_header_emitted = false;
+
+    for line in patch.lines() {
+        if line.starts_with("diff --git ") {
+            // Flush previous hunk
+            if hunk_matches && !current_hunk.is_empty() {
+                if !file_header_emitted {
+                    result.extend_from_slice(&current_file_header);
+                }
+                result.extend_from_slice(&current_hunk);
+            }
+            // Start new file section
+            current_file_header = vec![line];
+            current_hunk.clear();
+            hunk_matches = false;
+            file_header_emitted = false;
+        } else if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("index ") {
+            current_file_header.push(line);
+        } else if line.starts_with("@@") {
+            // Flush previous hunk
+            if hunk_matches && !current_hunk.is_empty() {
+                if !file_header_emitted {
+                    result.extend_from_slice(&current_file_header);
+                    file_header_emitted = true;
+                }
+                result.extend_from_slice(&current_hunk);
+            }
+            // Start new hunk
+            current_hunk = vec![line];
+            hunk_matches = false;
+        } else {
+            current_hunk.push(line);
+            if !hunk_matches
+                && (line.starts_with('+') || line.starts_with('-'))
+                && line.contains(symbol)
+            {
+                hunk_matches = true;
+            }
+        }
+    }
+    // Flush final hunk
+    if hunk_matches && !current_hunk.is_empty() {
+        if !file_header_emitted {
+            result.extend_from_slice(&current_file_header);
+        }
+        result.extend_from_slice(&current_hunk);
+    }
+    result.join("\n")
+}
+
+/// Check if a diff line mentions the symbol only in a definition context
+/// (fn, struct, enum, type, const, static, trait, mod).
+fn is_definition_line(line: &str, symbol: &str) -> bool {
+    let content = line.trim_start_matches(['+', '-']);
+    // Everything before the symbol name tells us if it's a definition
+    let before = content.split(symbol).next().unwrap_or("");
+    before.contains("fn ")
+        || before.contains("struct ")
+        || before.contains("enum ")
+        || before.contains("type ")
+        || before.contains("const ")
+        || before.contains("static ")
+        || before.contains("trait ")
+        || before.contains("mod ")
+}
+
+fn spawn_prefetcher(
+    items: Vec<(usize, String, PathBuf, usize)>,
+    workspace_root: PathBuf,
+    tx: mpsc::Sender<(usize, GitLoadState)>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        for (idx, name, file, line) in items {
+            // Signal: running blame
+            if tx.send((idx, GitLoadState::RunningBlame)).is_err() {
+                break;
+            }
+            let blame = git_blame(&file, line, &workspace_root);
+
+            // Signal: running log -S
+            if tx.send((idx, GitLoadState::RunningLogS)).is_err() {
+                break;
+            }
+            let log_entry = git_log_s(&name, &workspace_root);
+
+            let info = GitInfo { blame, log_entry };
+            if tx.send((idx, GitLoadState::Done(info))).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -112,10 +430,22 @@ const SKIP_SYMBOLS: &[&str] = &[
     "ActiveModelBehavior",
 ];
 
-fn collect_pub_symbols(crate_path: &Path) -> Result<Vec<PubSymbol>> {
+/// async-graphql attributes that mark items as framework-used.
+const GRAPHQL_ATTRS: &[&str] = &[
+    "Object",
+    "SimpleObject",
+    "MergedObject",
+    "InputObject",
+    "Mutation",
+    "Subscription",
+    "Interface",
+    "Union",
+];
+
+fn collect_pub_symbols(crate_path: &Path) -> Result<(Vec<PubSymbol>, Vec<(String, SkipReason)>)> {
     let src = crate_path.join("src");
     if !src.is_dir() {
-        return Ok(vec![]);
+        return Ok((vec![], vec![]));
     }
 
     let pattern = r"^\s*pub\s+(?:async\s+)?(?:fn|struct|enum|trait|type|const|static)\s+([A-Za-z_][A-Za-z0-9_]*)";
@@ -128,6 +458,7 @@ fn collect_pub_symbols(crate_path: &Path) -> Result<Vec<PubSymbol>> {
             .unwrap();
 
     let mut results: Vec<PubSymbol> = vec![];
+    let mut orm_skipped: Vec<(String, SkipReason)> = vec![];
     let mut searcher = Searcher::new();
 
     for entry in WalkBuilder::new(&src)
@@ -169,12 +500,16 @@ fn collect_pub_symbols(crate_path: &Path) -> Result<Vec<PubSymbol>> {
 
                 if let Some(caps) = extract_re.captures(line) {
                     let name = caps[1].to_string();
-                    if name.len() >= 2 && !SKIP_SYMBOLS.contains(&name.as_str()) {
-                        results.push(PubSymbol {
-                            name,
-                            file: path.to_path_buf(),
-                            line: line_num as usize,
-                        });
+                    if name.len() >= 2 {
+                        if SKIP_SYMBOLS.contains(&name.as_str()) {
+                            orm_skipped.push((name, SkipReason::Orm));
+                        } else {
+                            results.push(PubSymbol {
+                                name,
+                                file: path.to_path_buf(),
+                                line: line_num as usize,
+                            });
+                        }
                     }
                 }
                 Ok(true)
@@ -192,7 +527,11 @@ fn collect_pub_symbols(crate_path: &Path) -> Result<Vec<PubSymbol>> {
         }
     }
 
-    Ok(deduped)
+    // Deduplicate ORM skipped too
+    let mut orm_seen = HashSet::new();
+    orm_skipped.retain(|(name, _)| orm_seen.insert(name.clone()));
+
+    Ok((deduped, orm_skipped))
 }
 
 // ---------------------------------------------------------------------------
@@ -258,14 +597,71 @@ fn count_symbol_hits(
     Ok(counts)
 }
 
+/// Find all (file, line) locations where any of the given symbol names appear.
+fn find_symbol_locations(
+    names: &[&str],
+    search_dirs: &[PathBuf],
+) -> Result<Vec<(PathBuf, usize)>> {
+    if names.is_empty() || search_dirs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let alt = names
+        .iter()
+        .map(|n| regex::escape(n))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = format!(r"\b({})\b", alt);
+
+    let matcher = RegexMatcherBuilder::new()
+        .build(&pattern)
+        .context("building location search regex")?;
+
+    let mut locations = vec![];
+    let mut searcher = Searcher::new();
+
+    let mut walker = WalkBuilder::new(&search_dirs[0]);
+    for dir in &search_dirs[1..] {
+        walker.add(dir);
+    }
+    let walker = walker
+        .types(
+            ignore::types::TypesBuilder::new()
+                .add_defaults()
+                .select("rust")
+                .build()
+                .unwrap(),
+        )
+        .build();
+
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        searcher.search_path(
+            &matcher,
+            path,
+            UTF8(|line_num, _line| {
+                locations.push((path.to_path_buf(), line_num as usize));
+                Ok(true)
+            }),
+        )?;
+    }
+
+    Ok(locations)
+}
+
 // ---------------------------------------------------------------------------
 // Crate analysis
 // ---------------------------------------------------------------------------
 
 fn analyze_crate(
     crate_path: &Path,
-    all_crate_src_dirs: &[PathBuf],
+    all_crate_dirs: &[PathBuf],
     whitelist: &HashSet<(String, String)>,
+    on_progress: &dyn Fn(&str),
 ) -> Result<CrateResult> {
     let crate_name = crate_path
         .file_name()
@@ -273,35 +669,48 @@ fn analyze_crate(
         .to_str()
         .unwrap()
         .to_string();
-    let crate_src = crate_path.join("src");
 
-    eprintln!(
-        "  {} {}...",
-        "scanning".dimmed(),
-        crate_name.cyan(),
-    );
+    on_progress("collecting pub symbols…");
+    let (all_symbols, mut skipped) = collect_pub_symbols(crate_path)?;
+    let items_found = all_symbols.len();
 
-    let symbols = collect_pub_symbols(crate_path)?;
-    let items_found = symbols.len();
+    on_progress("filtering graphql-exempt…");
+    let (symbols, graphql_skipped) = filter_graphql_exempt(all_symbols);
+    skipped.extend(graphql_skipped);
 
     if symbols.is_empty() {
-        eprintln!(" {}", "0 pub items".dimmed());
         return Ok(CrateResult {
             crate_name,
             items_found: 0,
             unused: vec![],
+            skipped,
         });
     }
 
-    // External search: all other crate src dirs
-    let external_dirs: Vec<PathBuf> = all_crate_src_dirs
+    // External search: all other crate dirs (includes tests/, benches/)
+    let external_dirs: Vec<PathBuf> = all_crate_dirs
         .iter()
-        .filter(|d| **d != crate_src)
+        .filter(|d| d.as_path() != crate_path)
         .cloned()
         .collect();
 
     let symbol_names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
-    let external_counts = count_symbol_hits(&symbol_names, &external_dirs)?;
+
+    // Detect #[derive(Builder)] → also search for {Name}Builder
+    let builder_aliases = detect_builder_aliases(&symbols);
+    let mut ext_search: Vec<String> = symbol_names.clone();
+    for alias in builder_aliases.values() {
+        ext_search.push(alias.clone());
+    }
+
+    on_progress(&format!("searching {} symbols externally…", ext_search.len()));
+    let mut external_counts = count_symbol_hits(&ext_search, &external_dirs)?;
+    // Merge alias hits back to the original symbol
+    for (origin, alias) in &builder_aliases {
+        if let Some(&count) = external_counts.get(alias) {
+            *external_counts.entry(origin.clone()).or_insert(0) += count;
+        }
+    }
 
     // Find symbols with zero external hits
     let no_external: Vec<&PubSymbol> = symbols
@@ -309,9 +718,20 @@ fn analyze_crate(
         .filter(|s| external_counts.get(&s.name).copied().unwrap_or(0) == 0)
         .collect();
 
-    // Internal search for those symbols
-    let internal_names: Vec<String> = no_external.iter().map(|s| s.name.clone()).collect();
-    let internal_counts = count_symbol_hits(&internal_names, &[crate_src])?;
+    // Internal search for those symbols (including builder aliases)
+    let mut internal_search: Vec<String> = no_external.iter().map(|s| s.name.clone()).collect();
+    for sym in &no_external {
+        if let Some(alias) = builder_aliases.get(&sym.name) {
+            internal_search.push(alias.clone());
+        }
+    }
+    on_progress(&format!("searching {} symbols internally…", internal_search.len()));
+    let mut internal_counts = count_symbol_hits(&internal_search, &[crate_path.to_path_buf()])?;
+    for (origin, alias) in &builder_aliases {
+        if let Some(&count) = internal_counts.get(alias) {
+            *internal_counts.entry(origin.clone()).or_insert(0) += count;
+        }
+    }
 
     // Classify
     let mut unused = vec![];
@@ -334,23 +754,33 @@ fn analyze_crate(
             symbol: sym.clone(),
             kind,
             crate_name: crate_name.clone(),
+            internal_refs: vec![],
         });
     }
 
-    eprintln!(
-        " {} found, {} unused",
-        items_found.to_string().dimmed(),
-        if unused.is_empty() {
-            "0".green().to_string()
-        } else {
-            unused.len().to_string().yellow().to_string()
+    // For crate-internal items, find where the references are
+    for item in &mut unused {
+        if let SymbolKind::CrateInternalOnly { .. } = item.kind {
+            let mut search_names: Vec<&str> = vec![&item.symbol.name];
+            let alias;
+            if let Some(a) = builder_aliases.get(&item.symbol.name) {
+                alias = a.clone();
+                search_names.push(&alias);
+            }
+            let mut refs =
+                find_symbol_locations(&search_names, &[crate_path.to_path_buf()])?;
+            // Remove the definition line itself
+            refs.retain(|(f, l)| !(*f == item.symbol.file && *l == item.symbol.line));
+            item.internal_refs = refs;
         }
-    );
+    }
 
+    on_progress(&format!("done — {} issues found", unused.len()));
     Ok(CrateResult {
         crate_name,
         items_found,
         unused,
+        skipped,
     })
 }
 
@@ -528,6 +958,146 @@ fn find_item_at_line<'a>(
     None
 }
 
+// ---------------------------------------------------------------------------
+// GraphQL attribute detection (tree-sitter)
+// ---------------------------------------------------------------------------
+
+/// Check if a pub symbol at `line` (0-indexed) is exempt from unused detection
+/// because it has async-graphql attributes (directly or via parent impl block).
+fn is_graphql_exempt(source: &str, line: usize) -> bool {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return false,
+    };
+    let root = tree.root_node();
+
+    let item = match find_item_at_line(root, line) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Check direct attributes on the item (e.g. #[derive(SimpleObject)])
+    if node_has_graphql_attr(item, source) {
+        return true;
+    }
+
+    // If inside an impl block, check the impl block's attributes (e.g. #[Object])
+    let mut parent = item.parent();
+    while let Some(p) = parent {
+        if p.kind() == "impl_item" {
+            return node_has_graphql_attr(p, source);
+        }
+        parent = p.parent();
+    }
+
+    false
+}
+
+/// Check if a node's preceding sibling attributes contain any GRAPHQL_ATTRS.
+fn node_has_graphql_attr(node: tree_sitter::Node, source: &str) -> bool {
+    let mut sibling = node.prev_sibling();
+    while let Some(s) = sibling {
+        match s.kind() {
+            "attribute_item" => {
+                let text = &source[s.start_byte()..s.end_byte()];
+                for attr in GRAPHQL_ATTRS {
+                    if text.contains(attr) {
+                        return true;
+                    }
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        sibling = s.prev_sibling();
+    }
+    false
+}
+
+/// Filter out symbols that are exempt due to async-graphql attributes.
+/// Returns (kept symbols, names of skipped symbols).
+fn filter_graphql_exempt(symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(String, SkipReason)>) {
+    let mut kept = vec![];
+    let mut skipped = vec![];
+    for sym in symbols {
+        let source = match fs::read_to_string(&sym.file) {
+            Ok(s) => s,
+            Err(_) => {
+                kept.push(sym);
+                continue;
+            }
+        };
+        if is_graphql_exempt(&source, sym.line - 1) {
+            skipped.push((sym.name, SkipReason::Graphql));
+        } else {
+            kept.push(sym);
+        }
+    }
+    (kept, skipped)
+}
+
+// ---------------------------------------------------------------------------
+// derive_builder alias detection (tree-sitter)
+// ---------------------------------------------------------------------------
+
+/// Detect symbols with #[derive(Builder)] and return a map of name → ["{name}Builder"].
+/// These aliases should also be searched when counting references.
+fn detect_builder_aliases(symbols: &[PubSymbol]) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    for sym in symbols {
+        let source = match fs::read_to_string(&sym.file) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if has_derive_builder(&source, sym.line - 1) {
+            aliases.insert(sym.name.clone(), format!("{}Builder", sym.name));
+        }
+    }
+    aliases
+}
+
+/// Check if a symbol at `line` (0-indexed) has #[derive(Builder)].
+fn has_derive_builder(source: &str, line: usize) -> bool {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return false,
+    };
+    let root = tree.root_node();
+    let item = match find_item_at_line(root, line) {
+        Some(i) => i,
+        None => return false,
+    };
+    let mut sibling = item.prev_sibling();
+    while let Some(s) = sibling {
+        match s.kind() {
+            "attribute_item" => {
+                let text = &source[s.start_byte()..s.end_byte()];
+                if text.contains("derive") && text.contains("Builder") {
+                    return true;
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        sibling = s.prev_sibling();
+    }
+    false
+}
+
 /// Fallback: brace-counting heuristic when tree-sitter fails to parse.
 fn find_item_span_fallback(source: &str, start_line: usize) -> (usize, usize) {
     let lines: Vec<&str> = source.lines().collect();
@@ -636,123 +1206,1361 @@ fn apply_fix_unused(symbol: &UnusedSymbol) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Reporting
+// TUI
 // ---------------------------------------------------------------------------
 
-fn print_results(results: &[CrateResult], workspace_root: &Path) {
-    for result in results {
+/// What the TUI is currently showing.
+enum TuiPhase {
+    /// Crates are being scanned in the background; show progress.
+    Scanning,
+    Summary,
+    Review,
+}
+
+/// Summary screen sub-views.
+enum SummaryView {
+    /// Compact table: one row per crate.
+    Table,
+    /// Detailed: per-symbol listing with refs.
+    Detail,
+    /// Skipped: graphql-exempt symbols that were excluded from analysis.
+    Skipped,
+}
+
+/// Top-level app state for the unified TUI.
+struct App {
+    phase: TuiPhase,
+    results: Vec<CrateResult>,
+    all_unused: Vec<UnusedSymbol>,
+    workspace_root: PathBuf,
+    conn: Connection,
+    elapsed: Duration,
+    /// Currently highlighted menu item in the summary screen.
+    summary_selected: usize,
+    /// Which sub-view of the summary is active.
+    summary_view: SummaryView,
+    /// Scroll offset (used in table/detail/scanning views).
+    detail_scroll: u16,
+    /// Review sub-state (created when entering review phase).
+    review: Option<ReviewApp>,
+    /// Scan-in-progress state (present during Scanning phase).
+    scan: Option<ScanState>,
+    /// Which crates are expanded in the detail view.
+    detail_expanded: HashSet<String>,
+    /// Cursor position in the detail view (index among crates with unused items).
+    detail_cursor: usize,
+    /// Which crates are expanded in the skipped view.
+    skipped_expanded: HashSet<String>,
+    /// Cursor position in the skipped view (index among crates with skipped items).
+    skipped_cursor: usize,
+}
+
+struct ReviewApp {
+    items: Vec<UnusedSymbol>,
+    workspace_root: PathBuf,
+    current: usize,
+    git_states: Vec<GitLoadState>,
+    git_rx: mpsc::Receiver<(usize, GitLoadState)>,
+    selected_action: usize,
+    actions: Vec<Option<ReviewAction>>,
+    scroll_offset: u16,
+}
+
+/// Actions available from the summary menu.
+#[derive(Clone, Copy, PartialEq)]
+enum SummaryAction {
+    ReviewUnused,
+    ReviewCrateInternal,
+    FixAllUnused,
+    FixAllCrateInternal,
+    Quit,
+}
+
+fn summary_menu_items(app: &App) -> Vec<(SummaryAction, String)> {
+    let n_unused = app
+        .all_unused
+        .iter()
+        .filter(|u| u.kind == SymbolKind::UnusedAnywhere)
+        .count();
+    let n_internal = app
+        .all_unused
+        .iter()
+        .filter(|u| matches!(u.kind, SymbolKind::CrateInternalOnly { .. }))
+        .count();
+
+    let mut items = vec![];
+    if n_unused > 0 {
+        items.push((
+            SummaryAction::ReviewUnused,
+            format!("👀 (r) Review unused everywhere ({n_unused}) ← recommended"),
+        ));
+    }
+    if n_internal > 0 {
+        items.push((
+            SummaryAction::ReviewCrateInternal,
+            format!("👀 (i) Review crate-internal ({n_internal})"),
+        ));
+    }
+    if n_unused > 0 {
+        items.push((
+            SummaryAction::FixAllUnused,
+            format!("⚠️  (u) Fix all unused (delete {n_unused})"),
+        ));
+    }
+    if n_internal > 0 {
+        items.push((
+            SummaryAction::FixAllCrateInternal,
+            format!("🔧 (c) Fix all crate-internal → pub(crate) ({n_internal}) ← recommended"),
+        ));
+    }
+    items.push((SummaryAction::Quit, "🚪 (q) Quit".to_string()));
+    items
+}
+
+fn run_tui(
+    results: Vec<CrateResult>,
+    scan: Option<ScanState>,
+    workspace_root: &Path,
+    conn: Connection,
+    elapsed: Duration,
+) -> Result<()> {
+    let (phase, all_unused) = if scan.is_some() {
+        (TuiPhase::Scanning, vec![])
+    } else {
+        let all_unused = results.iter().flat_map(|r| r.unused.clone()).collect();
+        (TuiPhase::Summary, all_unused)
+    };
+
+    let mut app = App {
+        phase,
+        results,
+        all_unused,
+        workspace_root: workspace_root.to_path_buf(),
+        conn,
+        elapsed,
+        summary_selected: 0,
+        summary_view: SummaryView::Table,
+        detail_scroll: 0,
+        review: None,
+        scan,
+        detail_expanded: HashSet::new(),
+        detail_cursor: 0,
+        skipped_expanded: HashSet::new(),
+        skipped_cursor: 0,
+    };
+
+    // Enter alternate screen
+    let mut stdout = std::io::stdout();
+    terminal::enable_raw_mode()?;
+    stdout.execute(EnterAlternateScreen)?;
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = run_tui_main_loop(&mut terminal, &mut app);
+
+    // Restore terminal
+    terminal::disable_raw_mode()?;
+    terminal.backend_mut().execute(LeaveAlternateScreen)?;
+
+    result
+}
+
+fn is_quit_key(key: &event::KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('q') => true,
+        KeyCode::Char('c') | KeyCode::Char('d')
+            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn run_tui_main_loop(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    loop {
+        match app.phase {
+            TuiPhase::Scanning => {
+                // Drain messages from the scan channel
+                if let Some(ref mut scan) = app.scan {
+                    while let Ok((idx, msg)) = scan.rx.try_recv() {
+                        match msg {
+                            ScanMessage::Stage(desc) => {
+                                scan.stages[idx] = desc;
+                            }
+                            ScanMessage::Done(result) => {
+                                scan.completed[idx] = Some(result);
+                            }
+                        }
+                    }
+                }
+
+                terminal.draw(|frame| draw_scanning(frame, app))?;
+
+                // Check if all crates finished
+                if let Some(ref scan) = app.scan {
+                    if scan.completed.iter().all(|c| c.is_some()) {
+                        let scan = app.scan.take().unwrap();
+                        app.elapsed = scan.start.elapsed();
+                        app.results = scan.completed.into_iter().flatten().collect();
+                        app.results
+                            .sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+                        app.all_unused = app
+                            .results
+                            .iter()
+                            .flat_map(|r| r.unused.clone())
+                            .collect();
+                        app.phase = TuiPhase::Summary;
+                        continue;
+                    }
+                }
+
+                if event::poll(Duration::from_millis(100))? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        if is_quit_key(&key) {
+                            return Ok(());
+                        }
+                        match key.code {
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                app.detail_scroll = app.detail_scroll.saturating_add(1);
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                app.detail_scroll = app.detail_scroll.saturating_sub(1);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            TuiPhase::Summary => {
+                terminal.draw(|frame| draw_summary(frame, app))?;
+
+                if event::poll(Duration::from_millis(100))? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        if is_quit_key(&key) {
+                            return Ok(());
+                        }
+                        let menu = summary_menu_items(app);
+                        match key.code {
+                            KeyCode::Tab => {
+                                app.summary_view = match app.summary_view {
+                                    SummaryView::Table => SummaryView::Detail,
+                                    SummaryView::Detail => SummaryView::Skipped,
+                                    SummaryView::Skipped => SummaryView::Table,
+                                };
+                                app.detail_scroll = 0;
+                            }
+                            KeyCode::Char('j') => {
+                                match app.summary_view {
+                                    SummaryView::Detail => {
+                                        let max = app.results.iter().filter(|r| !r.unused.is_empty()).count();
+                                        if app.detail_cursor < max.saturating_sub(1) {
+                                            app.detail_cursor += 1;
+                                        }
+                                    }
+                                    SummaryView::Skipped => {
+                                        let max = app.results.iter().filter(|r| !r.skipped.is_empty()).count();
+                                        if app.skipped_cursor < max.saturating_sub(1) {
+                                            app.skipped_cursor += 1;
+                                        }
+                                    }
+                                    _ => {
+                                        app.detail_scroll = app.detail_scroll.saturating_add(1);
+                                    }
+                                }
+                            }
+                            KeyCode::Char('k') => {
+                                match app.summary_view {
+                                    SummaryView::Detail => {
+                                        app.detail_cursor = app.detail_cursor.saturating_sub(1);
+                                    }
+                                    SummaryView::Skipped => {
+                                        app.skipped_cursor = app.skipped_cursor.saturating_sub(1);
+                                    }
+                                    _ => {
+                                        app.detail_scroll = app.detail_scroll.saturating_sub(1);
+                                    }
+                                }
+                            }
+                            KeyCode::Char(' ') => {
+                                match app.summary_view {
+                                    SummaryView::Detail => {
+                                        let crate_name: Option<String> = app.results.iter()
+                                            .filter(|r| !r.unused.is_empty())
+                                            .nth(app.detail_cursor)
+                                            .map(|r| r.crate_name.clone());
+                                        if let Some(name) = crate_name {
+                                            if !app.detail_expanded.remove(&name) {
+                                                app.detail_expanded.insert(name);
+                                            }
+                                        }
+                                    }
+                                    SummaryView::Skipped => {
+                                        let crate_name: Option<String> = app.results.iter()
+                                            .filter(|r| !r.skipped.is_empty())
+                                            .nth(app.skipped_cursor)
+                                            .map(|r| r.crate_name.clone());
+                                        if let Some(name) = crate_name {
+                                            if !app.skipped_expanded.remove(&name) {
+                                                app.skipped_expanded.insert(name);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            KeyCode::Up => {
+                                if app.summary_selected > 0 {
+                                    app.summary_selected -= 1;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if app.summary_selected < menu.len().saturating_sub(1) {
+                                    app.summary_selected += 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some((action, _)) = menu.get(app.summary_selected) {
+                                    handle_summary_action(*action, app)?;
+                                }
+                            }
+                            // Hotkeys
+                            KeyCode::Char('r') => {
+                                if menu.iter().any(|(a, _)| *a == SummaryAction::ReviewUnused) {
+                                    handle_summary_action(SummaryAction::ReviewUnused, app)?;
+                                }
+                            }
+                            KeyCode::Char('i') => {
+                                if menu.iter().any(|(a, _)| *a == SummaryAction::ReviewCrateInternal) {
+                                    handle_summary_action(SummaryAction::ReviewCrateInternal, app)?;
+                                }
+                            }
+                            KeyCode::Char('u') => {
+                                if menu.iter().any(|(a, _)| *a == SummaryAction::FixAllUnused) {
+                                    handle_summary_action(SummaryAction::FixAllUnused, app)?;
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                if menu.iter().any(|(a, _)| *a == SummaryAction::FixAllCrateInternal) {
+                                    handle_summary_action(SummaryAction::FixAllCrateInternal, app)?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            TuiPhase::Review => {
+                if let Some(ref mut review) = app.review {
+                    // Drain git prefetch
+                    while let Ok((idx, state)) = review.git_rx.try_recv() {
+                        if idx == review.current {
+                            if let GitLoadState::Done(ref info) = state {
+                                if let Some(ref entry) = info.log_entry {
+                                    let symbol = &review.items[review.current].symbol.name;
+                                    review.scroll_offset = entry
+                                        .patch
+                                        .lines()
+                                        .position(|l| {
+                                            (l.starts_with('+') || l.starts_with('-'))
+                                                && l.contains(symbol.as_str())
+                                        })
+                                        .unwrap_or(0)
+                                        as u16;
+                                    if entry.definition_only {
+                                        review.selected_action = 0;
+                                    }
+                                }
+                            }
+                        }
+                        review.git_states[idx] = state;
+                    }
+
+                    terminal.draw(|frame| draw_review(frame, review))?;
+
+                    if event::poll(Duration::from_millis(100))? {
+                        if let Event::Key(key) = event::read()? {
+                            if key.kind != KeyEventKind::Press {
+                                continue;
+                            }
+                            if is_quit_key(&key) {
+                                // Apply any actions taken so far, then exit
+                                finish_review(app)?;
+                                return Ok(());
+                            }
+                            match key.code {
+                                KeyCode::Up => {
+                                    if review.selected_action > 0 {
+                                        review.selected_action -= 1;
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if review.selected_action < 2 {
+                                        review.selected_action += 1;
+                                    }
+                                }
+                                KeyCode::Char('j') => {
+                                    review.scroll_offset =
+                                        review.scroll_offset.saturating_add(1);
+                                }
+                                KeyCode::Char('k') => {
+                                    review.scroll_offset =
+                                        review.scroll_offset.saturating_sub(1);
+                                }
+                                KeyCode::Enter
+                                | KeyCode::Char('f')
+                                | KeyCode::Char('a')
+                                | KeyCode::Char('s') => {
+                                    let action = match key.code {
+                                        KeyCode::Char('f') => ReviewAction::Fix,
+                                        KeyCode::Char('a') => ReviewAction::Allowlist,
+                                        KeyCode::Char('s') => ReviewAction::Skip,
+                                        _ => match review.selected_action {
+                                            0 => ReviewAction::Fix,
+                                            1 => ReviewAction::Allowlist,
+                                            _ => ReviewAction::Skip,
+                                        },
+                                    };
+                                    review.actions[review.current] = Some(action);
+                                    review.current += 1;
+                                    review.selected_action = 2;
+                                    review.scroll_offset = 0;
+                                    if review.current >= review.items.len() {
+                                        finish_review(app)?;
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    // Back to summary (apply actions taken so far)
+                                    finish_review(app)?;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else {
+                    app.phase = TuiPhase::Summary;
+                }
+            }
+        }
+    }
+}
+
+fn handle_summary_action(action: SummaryAction, app: &mut App) -> Result<()> {
+    match action {
+        SummaryAction::ReviewUnused => {
+            let items: Vec<UnusedSymbol> = app
+                .all_unused
+                .iter()
+                .filter(|u| u.kind == SymbolKind::UnusedAnywhere)
+                .cloned()
+                .collect();
+            start_review(app, items);
+        }
+        SummaryAction::ReviewCrateInternal => {
+            let items: Vec<UnusedSymbol> = app
+                .all_unused
+                .iter()
+                .filter(|u| matches!(u.kind, SymbolKind::CrateInternalOnly { .. }))
+                .cloned()
+                .collect();
+            start_review(app, items);
+        }
+        SummaryAction::FixAllUnused => {
+            let to_fix: Vec<UnusedSymbol> = app
+                .all_unused
+                .iter()
+                .filter(|u| u.kind == SymbolKind::UnusedAnywhere)
+                .cloned()
+                .collect();
+            for item in &to_fix {
+                let _ = apply_fix_unused(item);
+            }
+            // Remove fixed items from all_unused
+            app.all_unused
+                .retain(|u| u.kind != SymbolKind::UnusedAnywhere);
+            // Update results
+            for r in &mut app.results {
+                r.unused.retain(|u| u.kind != SymbolKind::UnusedAnywhere);
+            }
+        }
+        SummaryAction::FixAllCrateInternal => {
+            let to_fix: Vec<UnusedSymbol> = app
+                .all_unused
+                .iter()
+                .filter(|u| matches!(u.kind, SymbolKind::CrateInternalOnly { .. }))
+                .cloned()
+                .collect();
+            for item in &to_fix {
+                let _ = apply_fix_crate_internal(item);
+            }
+            app.all_unused
+                .retain(|u| !matches!(u.kind, SymbolKind::CrateInternalOnly { .. }));
+            for r in &mut app.results {
+                r.unused
+                    .retain(|u| !matches!(u.kind, SymbolKind::CrateInternalOnly { .. }));
+            }
+        }
+        SummaryAction::Quit => {
+            // Signal exit — caller checks this won't happen since we handle 'q' separately
+        }
+    }
+    Ok(())
+}
+
+fn start_review(app: &mut App, items: Vec<UnusedSymbol>) {
+    if items.is_empty() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    let prefetch_items: Vec<(usize, String, PathBuf, usize)> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            (
+                i,
+                item.symbol.name.clone(),
+                item.symbol.file.clone(),
+                item.symbol.line,
+            )
+        })
+        .collect();
+    let prefetch_root = app.workspace_root.clone();
+    let _handle = spawn_prefetcher(prefetch_items, prefetch_root, tx);
+
+    let count = items.len();
+    app.review = Some(ReviewApp {
+        items,
+        workspace_root: app.workspace_root.clone(),
+        current: 0,
+        git_states: vec![GitLoadState::Pending; count],
+        git_rx: rx,
+        selected_action: 2,
+        actions: vec![None; count],
+        scroll_offset: 0,
+    });
+    app.phase = TuiPhase::Review;
+}
+
+fn finish_review(app: &mut App) -> Result<()> {
+    if let Some(review) = app.review.take() {
+        for (item, action) in review.items.iter().zip(review.actions.iter()) {
+            let action = match action {
+                Some(a) => a,
+                None => continue,
+            };
+            match action {
+                ReviewAction::Fix => match item.kind {
+                    SymbolKind::CrateInternalOnly { .. } => {
+                        apply_fix_crate_internal(item)?;
+                    }
+                    SymbolKind::UnusedAnywhere => {
+                        let _ = apply_fix_unused(item)?;
+                    }
+                },
+                ReviewAction::Allowlist => {
+                    add_to_whitelist(
+                        &app.conn,
+                        &item.symbol.name,
+                        &item.crate_name,
+                        &item.symbol.file.to_string_lossy(),
+                        None,
+                    )?;
+                }
+                ReviewAction::Skip => {}
+            }
+            // Remove acted-upon items from all_unused
+            let name = &item.symbol.name;
+            let crate_name = &item.crate_name;
+            if !matches!(action, ReviewAction::Skip) {
+                app.all_unused
+                    .retain(|u| !(u.symbol.name == *name && u.crate_name == *crate_name));
+                for r in &mut app.results {
+                    r.unused
+                        .retain(|u| !(u.symbol.name == *name && u.crate_name == *crate_name));
+                }
+            }
+        }
+    }
+    app.phase = TuiPhase::Summary;
+    app.summary_selected = 0;
+    Ok(())
+}
+
+fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
+    let dim = Style::default().fg(ctp(MOCHA.overlay0));
+    let scan = app.scan.as_ref().unwrap();
+
+    let done_count = scan.completed.iter().filter(|c| c.is_some()).count();
+    let total = scan.crate_names.len();
+    let elapsed = scan.start.elapsed();
+
+    let max_name_len = scan
+        .crate_names
+        .iter()
+        .map(|n| n.len())
+        .max()
+        .unwrap_or(10);
+
+    let title = format!(
+        " 🔍 find-unused-pub — scanning ({}/{} crates, {:.1}s) ",
+        done_count,
+        total,
+        elapsed.as_secs_f64()
+    );
+
+    let mut lines: Vec<Line> = vec![];
+
+    for (idx, name) in scan.crate_names.iter().enumerate() {
+        let name_padded = format!("{:<width$}", name, width = max_name_len);
+        if let Some(ref result) = scan.completed[idx] {
+            let n_unused = result
+                .unused
+                .iter()
+                .filter(|u| u.kind == SymbolKind::UnusedAnywhere)
+                .count();
+            let n_internal = result
+                .unused
+                .iter()
+                .filter(|u| matches!(u.kind, SymbolKind::CrateInternalOnly { .. }))
+                .count();
+
+            let mut spans = vec![
+                Span::styled("  ✅ ", Style::default().fg(ctp(MOCHA.green))),
+                Span::styled(name_padded, Style::default().fg(ctp(MOCHA.sapphire))),
+                Span::raw("  "),
+                Span::styled(format!("{:>3} found", result.items_found), dim),
+            ];
+
+            if n_unused > 0 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("❗ {n_unused} unused"),
+                    Style::default().fg(ctp(MOCHA.red)),
+                ));
+            }
+            if n_internal > 0 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("🔧 {n_internal} internal"),
+                    Style::default().fg(ctp(MOCHA.yellow)),
+                ));
+            }
+            if n_unused == 0 && n_internal == 0 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("✨ clean", Style::default().fg(ctp(MOCHA.green))));
+            }
+
+            lines.push(Line::from(spans));
+        } else {
+            let stage = &scan.stages[idx];
+            let stage_span = if stage.is_empty() {
+                Span::styled("waiting…", dim)
+            } else {
+                Span::styled(stage.as_str(), Style::default().fg(ctp(MOCHA.peach)))
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ⏳ ", Style::default().fg(ctp(MOCHA.peach))),
+                Span::styled(name_padded, Style::default().fg(ctp(MOCHA.subtext0))),
+                Span::raw("  "),
+                stage_span,
+            ]));
+        }
+    }
+
+    let widget = Paragraph::new(Text::from(lines))
+        .scroll((app.detail_scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .title(title)
+                .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+        );
+    frame.render_widget(widget, frame.area());
+}
+
+fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
+    let dim = Style::default().fg(ctp(MOCHA.overlay0));
+
+    // Layout: content area + menu at bottom
+    let rows = Layout::vertical([
+        Constraint::Min(10),   // content
+        Constraint::Length(8), // menu
+    ])
+    .split(frame.area());
+
+    let view_label = match app.summary_view {
+        SummaryView::Table => "📊 summary",
+        SummaryView::Detail => "📋 detail",
+        SummaryView::Skipped => "🛡️ skipped",
+    };
+    let title = format!(
+        " 📦 find-unused-pub — {} crates in {:.1}s ({}) ",
+        app.results.len(),
+        app.elapsed.as_secs_f64(),
+        view_label,
+    );
+
+    match app.summary_view {
+        SummaryView::Table => draw_summary_table(frame, app, rows[0], &title, dim),
+        SummaryView::Detail => draw_summary_detail(frame, app, rows[0], &title, dim),
+        SummaryView::Skipped => draw_summary_skipped(frame, app, rows[0], &title, dim),
+    }
+
+    // -- Menu (shared by all views) --
+    let menu = summary_menu_items(app);
+    let menu_items: Vec<ListItem> = menu
+        .iter()
+        .enumerate()
+        .map(|(i, (action, label))| {
+            let style = if i == app.summary_selected {
+                Style::default()
+                    .fg(ctp(MOCHA.base))
+                    .bg(ctp(MOCHA.lavender))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                match action {
+                    SummaryAction::ReviewUnused => Style::default().fg(ctp(MOCHA.green)),
+                    SummaryAction::ReviewCrateInternal => Style::default().fg(ctp(MOCHA.sapphire)),
+                    SummaryAction::FixAllUnused => Style::default().fg(ctp(MOCHA.red)),
+                    SummaryAction::FixAllCrateInternal => Style::default().fg(ctp(MOCHA.green)),
+                    SummaryAction::Quit => Style::default().fg(ctp(MOCHA.text)),
+                }
+            };
+            ListItem::new(label.as_str()).style(style)
+        })
+        .collect();
+    let mut list_state = ListState::default().with_selected(Some(app.summary_selected));
+    let menu_widget = List::new(menu_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, j/k: scroll, q: quit) ")
+                .title_style(Style::default().fg(ctp(MOCHA.peach))),
+        )
+        .highlight_symbol("▸ ");
+    frame.render_stateful_widget(menu_widget, rows[1], &mut list_state);
+}
+
+fn draw_summary_table(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    title: &str,
+    dim: Style,
+) {
+    let max_name_len = app
+        .results
+        .iter()
+        .map(|r| r.crate_name.len())
+        .max()
+        .unwrap_or(10);
+
+    let mut table_lines: Vec<Line> = vec![];
+
+    for result in &app.results {
+        let n_unused = result
+            .unused
+            .iter()
+            .filter(|u| u.kind == SymbolKind::UnusedAnywhere)
+            .count();
+        let n_internal = result
+            .unused
+            .iter()
+            .filter(|u| matches!(u.kind, SymbolKind::CrateInternalOnly { .. }))
+            .count();
+
+        let name_padded = format!("{:<width$}", result.crate_name, width = max_name_len);
+        let found_str = format!("{:>3} found", result.items_found);
+
+        let mut spans = vec![
+            Span::styled(name_padded, Style::default().fg(ctp(MOCHA.sapphire))),
+            Span::raw("  "),
+            Span::styled(found_str, dim),
+        ];
+
+        if n_unused > 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("❗ {n_unused} unused"),
+                Style::default().fg(ctp(MOCHA.red)),
+            ));
+        }
+        if n_internal > 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("🔧 {n_internal} internal"),
+                Style::default().fg(ctp(MOCHA.yellow)),
+            ));
+        }
+        if n_unused == 0 && n_internal == 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("✨ clean", Style::default().fg(ctp(MOCHA.green))));
+        }
+
+        table_lines.push(Line::from(spans));
+    }
+
+    // Totals
+    let total_unused: usize = app
+        .all_unused
+        .iter()
+        .filter(|u| u.kind == SymbolKind::UnusedAnywhere)
+        .count();
+    let total_internal: usize = app
+        .all_unused
+        .iter()
+        .filter(|u| matches!(u.kind, SymbolKind::CrateInternalOnly { .. }))
+        .count();
+    let total_found: usize = app.results.iter().map(|r| r.items_found).sum();
+    table_lines.push(Line::raw(""));
+    let mut total_spans = vec![
+        Span::styled(
+            format!("{:<width$}", "TOTAL", width = max_name_len),
+            Style::default().fg(ctp(MOCHA.text)).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(format!("{:>3} found", total_found), dim),
+    ];
+    if total_unused > 0 {
+        total_spans.push(Span::raw("  "));
+        total_spans.push(Span::styled(
+            format!("❗ {total_unused} unused"),
+            Style::default().fg(ctp(MOCHA.red)).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if total_internal > 0 {
+        total_spans.push(Span::raw("  "));
+        total_spans.push(Span::styled(
+            format!("🔧 {total_internal} internal"),
+            Style::default()
+                .fg(ctp(MOCHA.yellow))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if total_unused == 0 && total_internal == 0 {
+        total_spans.push(Span::raw("  "));
+        total_spans.push(Span::styled(
+            "✨ all clean!",
+            Style::default()
+                .fg(ctp(MOCHA.green))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    table_lines.push(Line::from(total_spans));
+
+    let table_widget = Paragraph::new(Text::from(table_lines))
+        .scroll((app.detail_scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .title(title.to_string())
+                .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+        );
+    frame.render_widget(table_widget, area);
+}
+
+fn draw_summary_detail(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    title: &str,
+    dim: Style,
+) {
+    let total_unused: usize = app.all_unused.len();
+    let mut lines: Vec<Line> = vec![];
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("📋 {total_unused} issues"),
+            Style::default().fg(ctp(MOCHA.text)).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled("j/k: navigate crates, Space: expand/collapse", dim),
+    ]));
+    lines.push(Line::raw(""));
+
+    let mut crate_idx = 0usize;
+    for result in &app.results {
         if result.unused.is_empty() {
             continue;
         }
 
-        println!(
-            "{} {}",
-            result.crate_name.bold().cyan(),
-            format!("({}/{})", result.unused.len(), result.items_found).dimmed(),
-        );
+        let is_focused = crate_idx == app.detail_cursor;
+        let is_expanded = app.detail_expanded.contains(&result.crate_name);
+        let arrow = if is_expanded { "▼" } else { "▶" };
+        let cursor_indicator = if is_focused { "▸ " } else { "  " };
 
-        for item in &result.unused {
-            match item.kind {
-                SymbolKind::UnusedAnywhere => {
-                    println!(
-                        "  {} {}",
-                        item.symbol.name.red(),
-                        "unused anywhere".dimmed(),
-                    );
+        let n_unused = result.unused.iter().filter(|u| u.kind == SymbolKind::UnusedAnywhere).count();
+        let n_internal = result.unused.iter().filter(|u| matches!(u.kind, SymbolKind::CrateInternalOnly { .. })).count();
+
+        let name_style = if is_focused {
+            Style::default()
+                .fg(ctp(MOCHA.sapphire))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default()
+                .fg(ctp(MOCHA.sapphire))
+                .add_modifier(Modifier::BOLD)
+        };
+
+        let mut header_spans = vec![
+            Span::styled(cursor_indicator, Style::default().fg(ctp(MOCHA.lavender))),
+            Span::styled(format!("{arrow} "), Style::default().fg(ctp(MOCHA.overlay1))),
+            Span::styled(&result.crate_name, name_style),
+            Span::raw(" "),
+            Span::styled(
+                format!("({}/{})", result.unused.len(), result.items_found),
+                dim,
+            ),
+        ];
+        if n_unused > 0 {
+            header_spans.push(Span::raw("  "));
+            header_spans.push(Span::styled(
+                format!("❗ {n_unused}"),
+                Style::default().fg(ctp(MOCHA.red)),
+            ));
+        }
+        if n_internal > 0 {
+            header_spans.push(Span::raw("  "));
+            header_spans.push(Span::styled(
+                format!("🔧 {n_internal}"),
+                Style::default().fg(ctp(MOCHA.yellow)),
+            ));
+        }
+        lines.push(Line::from(header_spans));
+
+        if is_expanded {
+            for item in &result.unused {
+                match item.kind {
+                    SymbolKind::UnusedAnywhere => {
+                        lines.push(Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled(
+                                format!("❗ {}", item.symbol.name),
+                                Style::default().fg(ctp(MOCHA.red)),
+                            ),
+                            Span::raw(" "),
+                            Span::styled("unused everywhere", dim),
+                        ]));
+                    }
+                    SymbolKind::CrateInternalOnly { refs } => {
+                        lines.push(Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled(
+                                format!("🔧 {}", item.symbol.name),
+                                Style::default().fg(ctp(MOCHA.yellow)),
+                            ),
+                            Span::raw(" "),
+                            Span::styled(
+                                format!("crate-internal only ({refs} refs)"),
+                                dim,
+                            ),
+                        ]));
+                    }
                 }
-                SymbolKind::CrateInternalOnly { refs } => {
-                    println!(
-                        "  {} {}",
-                        item.symbol.name.yellow(),
-                        format!("crate-internal only ({} refs) → consider pub(crate)", refs)
-                            .dimmed(),
-                    );
+                let rel_path = item
+                    .symbol
+                    .file
+                    .strip_prefix(&app.workspace_root)
+                    .unwrap_or(&item.symbol.file);
+                lines.push(Line::from(Span::styled(
+                    format!("        {}:{}", rel_path.display(), item.symbol.line),
+                    Style::default().fg(ctp(MOCHA.subtext0)),
+                )));
+                for (ref_file, ref_line) in &item.internal_refs {
+                    let rel = ref_file
+                        .strip_prefix(&app.workspace_root)
+                        .unwrap_or(ref_file);
+                    lines.push(Line::from(Span::styled(
+                        format!("          ↳ {}:{}", rel.display(), ref_line),
+                        Style::default().fg(ctp(MOCHA.overlay1)),
+                    )));
                 }
             }
-            let rel_path = item
-                .symbol
-                .file
-                .strip_prefix(workspace_root)
-                .unwrap_or(&item.symbol.file);
-            println!(
-                "    {}",
-                format!("{}:{}", rel_path.display(), item.symbol.line).dimmed(),
-            );
         }
-        println!();
+
+        crate_idx += 1;
     }
+
+    if total_unused == 0 {
+        lines.push(Line::from(Span::styled("No issues found.", dim)));
+    }
+
+    let detail_widget = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .title(title.to_string())
+                .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+        );
+    frame.render_widget(detail_widget, area);
 }
 
-// ---------------------------------------------------------------------------
-// Review
-// ---------------------------------------------------------------------------
+fn draw_summary_skipped(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    title: &str,
+    dim: Style,
+) {
+    let mut lines: Vec<Line> = vec![];
 
-fn review_item(item: &UnusedSymbol, conn: &Connection) -> Result<()> {
-    let kind_label = match item.kind {
-        SymbolKind::UnusedAnywhere => "unused anywhere".red().to_string(),
-        SymbolKind::CrateInternalOnly { refs } => {
-            format!("crate-internal only ({refs} refs)").yellow().to_string()
+    let total_skipped: usize = app.results.iter().map(|r| r.skipped.len()).sum();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("🛡️  {total_skipped} symbols skipped"),
+            Style::default().fg(ctp(MOCHA.text)).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled("(graphql, orm, derive(Builder))", dim),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "j/k: navigate crates, Space: expand/collapse",
+        dim,
+    )));
+    lines.push(Line::raw(""));
+
+    let mut crate_idx = 0usize;
+    for result in &app.results {
+        if result.skipped.is_empty() {
+            continue;
         }
-    };
 
-    println!(
-        "\n  {} {} in {}",
-        item.symbol.name.bold(),
-        kind_label,
-        item.crate_name.cyan(),
-    );
-    println!(
-        "    {}",
-        format!("{}:{}", item.symbol.file.display(), item.symbol.line).dimmed(),
-    );
+        let is_focused = crate_idx == app.skipped_cursor;
+        let is_expanded = app.skipped_expanded.contains(&result.crate_name);
+        let arrow = if is_expanded { "▼" } else { "▶" };
+        let cursor_indicator = if is_focused { "▸ " } else { "  " };
 
-    let fix_label = match item.kind {
-        SymbolKind::UnusedAnywhere => "Fix (delete item)",
-        SymbolKind::CrateInternalOnly { .. } => "Fix (→ pub(crate))",
-    };
+        let name_style = if is_focused {
+            Style::default()
+                .fg(ctp(MOCHA.sapphire))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default()
+                .fg(ctp(MOCHA.sapphire))
+                .add_modifier(Modifier::BOLD)
+        };
 
-    let selection = Select::new()
-        .with_prompt("  Action")
-        .items(&[fix_label, "Whitelist (skip in future)", "Skip"])
-        .default(2)
-        .interact()?;
+        lines.push(Line::from(vec![
+            Span::styled(cursor_indicator, Style::default().fg(ctp(MOCHA.lavender))),
+            Span::styled(format!("{arrow} "), Style::default().fg(ctp(MOCHA.overlay1))),
+            Span::styled(&result.crate_name, name_style),
+            Span::raw(" "),
+            Span::styled(
+                format!("({} skipped)", result.skipped.len()),
+                dim,
+            ),
+        ]));
 
-    match selection {
-        0 => match item.kind {
-            SymbolKind::CrateInternalOnly { .. } => {
-                apply_fix_crate_internal(item)?;
-                println!("    {}", "fixed → pub(crate)".green());
+        if is_expanded {
+            for (name, reason) in &result.skipped {
+                let reason_label = match reason {
+                    SkipReason::Graphql => Span::styled(" [graphql]", Style::default().fg(ctp(MOCHA.mauve))),
+                    SkipReason::Orm => Span::styled(" [orm]", Style::default().fg(ctp(MOCHA.teal))),
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(name.as_str(), Style::default().fg(ctp(MOCHA.subtext0))),
+                    reason_label,
+                ]));
             }
-            SymbolKind::UnusedAnywhere => {
-                let preview = apply_fix_unused(item)?;
-                println!("    {} {}", "deleted:".green(), preview.dimmed());
-            }
-        },
-        1 => {
-            let reason: String = dialoguer::Input::new()
-                .with_prompt("    Reason (optional)")
-                .allow_empty(true)
-                .interact_text()?;
-            let reason = if reason.is_empty() {
-                None
-            } else {
-                Some(reason.as_str())
-            };
-            add_to_whitelist(
-                conn,
-                &item.symbol.name,
-                &item.crate_name,
-                &item.symbol.file.to_string_lossy(),
-                reason,
-            )?;
-            println!("    {}", "whitelisted".green());
         }
-        _ => {
-            println!("    {}", "skipped".dimmed());
-        }
+
+        crate_idx += 1;
     }
 
-    Ok(())
+    if total_skipped == 0 {
+        lines.push(Line::from(Span::styled("No symbols were skipped.", dim)));
+    }
+
+    let widget = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .title(title.to_string())
+                .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+        );
+    frame.render_widget(widget, area);
+}
+
+fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
+    let item = &app.items[app.current];
+    let total = app.items.len();
+
+    let rel_path = item
+        .symbol
+        .file
+        .strip_prefix(&app.workspace_root)
+        .unwrap_or(&item.symbol.file);
+    let dim = Style::default().fg(ctp(MOCHA.overlay0));
+    let label_style = Style::default().fg(ctp(MOCHA.peach));
+
+    let is_definition_only = matches!(
+        &app.git_states[app.current],
+        GitLoadState::Done(info) if info.log_entry.as_ref().is_some_and(|e| e.definition_only)
+    );
+
+    // Top-level: main content area + action bar at bottom
+    let rows = Layout::vertical([
+        Constraint::Min(8),     // main content
+        Constraint::Length(5),  // actions
+    ])
+    .split(frame.area());
+
+    // Main content: left info column | right patch column
+    let cols = Layout::horizontal([
+        Constraint::Percentage(40), // info side
+        Constraint::Percentage(60), // patch side
+    ])
+    .split(rows[0]);
+
+    // Left column: symbol info + git context stacked
+    let left_rows = Layout::vertical([
+        Constraint::Length(4),  // symbol info
+        Constraint::Min(4),    // git context
+    ])
+    .split(cols[0]);
+
+    // -- Symbol info (top-left) --
+    let kind_label = match item.kind {
+        SymbolKind::UnusedAnywhere => Span::styled("❗ unused everywhere", Style::default().fg(ctp(MOCHA.red))),
+        SymbolKind::CrateInternalOnly { refs } => Span::styled(
+            format!("🔧 crate-internal only ({refs} refs)"),
+            Style::default().fg(ctp(MOCHA.yellow)),
+        ),
+    };
+    let symbol_text = Text::from(vec![
+        Line::from(vec![
+            Span::styled(
+                &item.symbol.name,
+                Style::default().fg(ctp(MOCHA.text)).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            kind_label,
+        ]),
+        Line::from(Span::styled(
+            format!("{}:{}", rel_path.display(), item.symbol.line),
+            Style::default().fg(ctp(MOCHA.subtext0)),
+        )),
+    ]);
+    let review_title = if is_definition_only {
+        format!(" 🧹 Review ({}/{}) — ✅ SAFE DELETE ", app.current + 1, total)
+    } else {
+        format!(" 🔍 Review ({}/{}) ", app.current + 1, total)
+    };
+    let symbol_border_style = if is_definition_only {
+        Style::default().fg(ctp(MOCHA.green))
+    } else {
+        Style::default().fg(ctp(MOCHA.surface2))
+    };
+    let symbol_block = Paragraph::new(symbol_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(symbol_border_style)
+            .title(review_title)
+            .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+    );
+    frame.render_widget(symbol_block, left_rows[0]);
+
+    // -- Git context (bottom-left) --
+    let git_text = match &app.git_states[app.current] {
+        GitLoadState::Pending => {
+            Text::from(Span::styled("⏳ waiting...", dim))
+        }
+        GitLoadState::RunningBlame => {
+            Text::from(Span::styled(
+                format!("⏳ $ git blame -L{0},{0} --porcelain {1}", item.symbol.line, rel_path.display()),
+                dim,
+            ))
+        }
+        GitLoadState::RunningLogS => {
+            Text::from(Span::styled(
+                format!("⏳ $ git log -1 -S '{}' --patch -- '**/*.rs'", item.symbol.name),
+                dim,
+            ))
+        }
+        GitLoadState::Done(info) => {
+            let mut lines = vec![];
+
+            if let Some(blame) = &info.blame {
+                lines.push(Line::from(vec![
+                    Span::styled("📝 Line last modified ", label_style),
+                    Span::styled(&blame.age, Style::default().fg(ctp(MOCHA.mauve))),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  ({}) by {}", blame.date, blame.author),
+                        dim,
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(&blame.short_hash, Style::default().fg(ctp(MOCHA.sapphire))),
+                    Span::raw(" "),
+                    Span::styled(&blame.summary, Style::default().fg(ctp(MOCHA.text))),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!("  $ git show {}", blame.short_hash),
+                    dim,
+                )));
+            }
+
+            if let Some(entry) = &info.log_entry {
+                if !lines.is_empty() {
+                    lines.push(Line::raw(""));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("🔎 Symbol last added/removed ", label_style),
+                    Span::styled(&entry.age, Style::default().fg(ctp(MOCHA.mauve))),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  ({}) by {}", entry.date, entry.author),
+                        dim,
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(&entry.short_hash, Style::default().fg(ctp(MOCHA.sapphire))),
+                    Span::raw(" "),
+                    Span::styled(&entry.subject, Style::default().fg(ctp(MOCHA.text))),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!("  $ git show {}", entry.short_hash),
+                    dim,
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("  $ git log -S '{}' -- '**/*.rs'", item.symbol.name),
+                    dim,
+                )));
+            }
+
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled("no git history found", dim)));
+            }
+            Text::from(lines)
+        }
+    };
+    let git_block = Paragraph::new(git_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .title(" 🕰️  Git context ")
+                .title_style(Style::default().fg(ctp(MOCHA.peach))),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(git_block, left_rows[1]);
+
+    // -- Patch diff (right column, full height) --
+    let mut patch_lines: Vec<Line> = vec![];
+    let mut patch_title = String::from(" Patch ");
+    if let GitLoadState::Done(info) = &app.git_states[app.current] {
+        if let Some(entry) = &info.log_entry {
+            patch_title = format!(" 📄 Patch from {} (j/k to scroll) ", entry.short_hash);
+            // Show grep-like matches first
+            if !entry.diff_matches.is_empty() {
+                patch_lines.push(Line::from(Span::styled(
+                    format!("All occurrences in diff ({}):", entry.diff_matches.len()),
+                    label_style,
+                )));
+                for m in &entry.diff_matches {
+                    let style = if m.starts_with('+') {
+                        Style::default().fg(ctp(MOCHA.green))
+                    } else {
+                        Style::default().fg(ctp(MOCHA.red))
+                    };
+                    patch_lines.push(Line::from(Span::styled(m.as_str(), style)));
+                }
+                patch_lines.push(Line::raw(""));
+            }
+            for patch_line in entry.patch.lines().skip(app.scroll_offset as usize) {
+                let style = if patch_line.starts_with('+') && !patch_line.starts_with("+++") {
+                    Style::default().fg(ctp(MOCHA.green))
+                } else if patch_line.starts_with('-') && !patch_line.starts_with("---") {
+                    Style::default().fg(ctp(MOCHA.red))
+                } else if patch_line.starts_with("@@") {
+                    Style::default().fg(ctp(MOCHA.sky))
+                } else {
+                    Style::default().fg(ctp(MOCHA.overlay0))
+                };
+                patch_lines.push(Line::from(Span::styled(patch_line, style)));
+            }
+        }
+    }
+    if patch_lines.is_empty() {
+        match &app.git_states[app.current] {
+            GitLoadState::Pending | GitLoadState::RunningBlame | GitLoadState::RunningLogS => {
+                patch_lines.push(Line::from(Span::styled("⏳ loading...", dim)));
+            }
+            GitLoadState::Done(_) => {
+                patch_lines.push(Line::from(Span::styled("no patch available", dim)));
+            }
+        }
+    }
+    let patch_block = Paragraph::new(Text::from(patch_lines))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .title(patch_title)
+                .title_style(Style::default().fg(ctp(MOCHA.peach))),
+        );
+    frame.render_widget(patch_block, cols[1]);
+
+    // -- Action selector (bottom, full width) --
+    let fix_label = if is_definition_only {
+        match item.kind {
+            SymbolKind::UnusedAnywhere => "🗑️  (f) Fix (delete) ← recommended",
+            SymbolKind::CrateInternalOnly { .. } => "🔧 (f) Fix (pub(crate)) ← recommended",
+        }
+    } else {
+        match item.kind {
+            SymbolKind::UnusedAnywhere => "🗑️  (f) Fix (delete item)",
+            SymbolKind::CrateInternalOnly { .. } => "🔧 (f) Fix (pub(crate))",
+        }
+    };
+    let action_labels = [fix_label, "📋 (a) Allowlist", "⏭️  (s) Skip"];
+    let action_items: Vec<ListItem> = action_labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let style = if i == app.selected_action {
+                Style::default()
+                    .fg(ctp(MOCHA.base))
+                    .bg(ctp(MOCHA.lavender))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(ctp(MOCHA.text))
+            };
+            ListItem::new(*label).style(style)
+        })
+        .collect();
+    let mut list_state = ListState::default().with_selected(Some(app.selected_action));
+    let action_list = List::new(action_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .title(" ⚡ Action (f/a/s or ↑↓+Enter, j/k scroll, q quit) ")
+                .title_style(Style::default().fg(ctp(MOCHA.peach))),
+        )
+        .highlight_symbol("▸ ");
+    frame.render_stateful_widget(action_list, rows[1], &mut list_state);
 }
 
 // ---------------------------------------------------------------------------
@@ -772,12 +2580,10 @@ async fn main() -> Result<()> {
     let conn = open_db(&workspace_root)?;
     if args.nuke_whitelist {
         nuke_whitelist(&conn)?;
-        println!("{}", "Whitelist cleared.".green());
+        eprintln!("{}", "Whitelist cleared.".green());
         if args.crate_paths.is_empty()
             && !args.should_fix_crate_internal()
             && !args.fix_unused
-            && !args.should_review_unused()
-            && !args.review_crate_internal
         {
             return Ok(());
         }
@@ -809,61 +2615,35 @@ async fn main() -> Result<()> {
             .collect()
     };
 
-    // Build list of all crate src dirs (for external search)
-    let all_crate_src_dirs: Vec<PathBuf> = fs::read_dir(&crates_dir)?
+    // Build list of all crate dirs (includes src/, tests/, benches/ for searching)
+    let all_crate_dirs: Vec<PathBuf> = fs::read_dir(&crates_dir)?
         .flatten()
         .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
-        .map(|e| e.path().join("src"))
-        .filter(|p| p.is_dir())
+        .map(|e| e.path())
         .collect();
 
-    eprintln!(
-        "{} {} crates",
-        "Scanning".bold(),
-        target_crates.len(),
-    );
-
-    // Scan crates in parallel using tokio tasks
-    let mut handles = vec![];
-    for crate_path in &target_crates {
-        let crate_path = crate_path.clone();
-        let all_dirs = all_crate_src_dirs.clone();
-        let wl = whitelist.clone();
-        handles.push(tokio::task::spawn_blocking(move || {
-            analyze_crate(&crate_path, &all_dirs, &wl)
-        }));
-    }
-
-    let mut results = vec![];
-    for handle in handles {
-        results.push(handle.await??);
-    }
-
-    // Print results
-    eprintln!();
-    print_results(&results, &workspace_root);
-
-    let total_unused: usize = results.iter().map(|r| r.unused.len()).sum();
-    println!(
-        "{}",
-        format!("Total: {} potentially unused pub items", total_unused).bold(),
-    );
-
-    let elapsed = start.elapsed();
-    eprintln!(
-        "{}",
-        format!("Done in {:.1}s", elapsed.as_secs_f64()).dimmed(),
-    );
-
-    // Collect all unused items for fix/review
-    let all_unused: Vec<UnusedSymbol> = results
-        .into_iter()
-        .flat_map(|r| r.unused)
-        .collect();
-
-    // Auto-fix
-    let mut fixed = 0;
+    // Non-interactive batch fix: must await all results first
     if args.should_fix_crate_internal() || args.fix_unused {
+        let mut handles = vec![];
+        for crate_path in &target_crates {
+            let crate_path = crate_path.clone();
+            let all_dirs = all_crate_dirs.clone();
+            let wl = whitelist.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                analyze_crate(&crate_path, &all_dirs, &wl, &|_| {})
+            }));
+        }
+        let mut results = vec![];
+        for handle in handles {
+            results.push(handle.await??);
+        }
+        let elapsed = start.elapsed();
+
+        let all_unused: Vec<UnusedSymbol> = results
+            .iter()
+            .flat_map(|r| r.unused.clone())
+            .collect();
+        let mut fixed = 0;
         for item in &all_unused {
             let should_fix = match item.kind {
                 SymbolKind::CrateInternalOnly { .. } => args.should_fix_crate_internal(),
@@ -873,14 +2653,14 @@ async fn main() -> Result<()> {
                 let label = match item.kind {
                     SymbolKind::CrateInternalOnly { .. } => {
                         apply_fix_crate_internal(item)?;
-                        "→ pub(crate)"
+                        "-> pub(crate)"
                     }
                     SymbolKind::UnusedAnywhere => {
                         let _preview = apply_fix_unused(item)?;
-                        "→ deleted"
+                        "-> deleted"
                     }
                 };
-                println!(
+                eprintln!(
                     "  {} {} {}",
                     "fixed".green(),
                     item.symbol.name.bold(),
@@ -890,27 +2670,68 @@ async fn main() -> Result<()> {
             }
         }
         if fixed > 0 {
-            println!("{}", format!("Fixed {fixed} items").bold().green());
+            eprintln!("{}", format!("Fixed {fixed} items").bold().green());
         }
+        // Don't launch TUI if only batch-fixing
+        if !args.should_review_unused() && !args.review_crate_internal {
+            return Ok(());
+        }
+        // Launch TUI with pre-scanned results
+        run_tui(results, None, &workspace_root, conn, elapsed)?;
+        return Ok(());
     }
 
-    // Interactive review
-    if args.should_review_unused() || args.review_crate_internal {
-        for item in &all_unused {
-            let should_review = match item.kind {
-                SymbolKind::UnusedAnywhere => args.should_review_unused(),
-                SymbolKind::CrateInternalOnly { .. } => args.review_crate_internal,
+    // Streaming TUI: start immediately, show scan progress
+    let crate_names: Vec<String> = target_crates
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    let n_crates = crate_names.len();
+    let (scan_tx, scan_rx) = mpsc::channel();
+    for (idx, crate_path) in target_crates.iter().enumerate() {
+        let crate_path = crate_path.clone();
+        let all_dirs = all_crate_dirs.clone();
+        let wl = whitelist.clone();
+        let tx = scan_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let progress_tx = tx.clone();
+            let progress_idx = idx;
+            let on_progress = move |msg: &str| {
+                let _ = progress_tx.send((progress_idx, ScanMessage::Stage(msg.to_string())));
             };
-            // Skip items that were already auto-fixed
-            let already_fixed = match item.kind {
-                SymbolKind::CrateInternalOnly { .. } => args.should_fix_crate_internal(),
-                SymbolKind::UnusedAnywhere => args.fix_unused,
-            };
-            if should_review && !already_fixed {
-                review_item(item, &conn)?;
-            }
-        }
+            let result = analyze_crate(&crate_path, &all_dirs, &wl, &on_progress)
+                .unwrap_or_else(|_| {
+                    CrateResult {
+                        crate_name: crate_path
+                            .file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string(),
+                        items_found: 0,
+                        unused: vec![],
+                        skipped: vec![],
+                    }
+                });
+            let _ = tx.send((idx, ScanMessage::Done(result)));
+        });
     }
+    drop(scan_tx);
+
+    let scan_state = ScanState {
+        crate_names,
+        stages: (0..n_crates).map(|_| String::new()).collect(),
+        completed: (0..n_crates).map(|_| None).collect(),
+        rx: scan_rx,
+        start,
+    };
+    run_tui(vec![], Some(scan_state), &workspace_root, conn, Duration::ZERO)?;
 
     Ok(())
 }
@@ -956,14 +2777,13 @@ mod tests {
         tmp
     }
 
-    fn crate_src_dirs(tmp: &TempDir) -> Vec<PathBuf> {
+    fn crate_dirs(tmp: &TempDir) -> Vec<PathBuf> {
         let crates_dir = tmp.path().join("crates");
         fs::read_dir(&crates_dir)
             .unwrap()
             .flatten()
             .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
-            .map(|e| e.path().join("src"))
-            .filter(|p| p.is_dir())
+            .map(|e| e.path())
             .collect()
     }
 
@@ -1055,7 +2875,7 @@ pub fn other() {}
                 "pub fn foo() {}\npub struct Bar {}\nfn private() {}\npub(crate) fn scoped() {}\n",
             )],
         )]);
-        let symbols = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
+        let (symbols, _skipped) = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"foo"));
         assert!(names.contains(&"Bar"));
@@ -1072,7 +2892,7 @@ pub fn other() {}
                 "pub struct Model {}\npub struct Entity {}\npub fn real_thing() {}\n",
             )],
         )]);
-        let symbols = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
+        let (symbols, _skipped) = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(!names.contains(&"Model"));
         assert!(!names.contains(&"Entity"));
@@ -1120,9 +2940,9 @@ pub fn other() {}
             ),
         ]);
         let crate_path = ws.path().join("crates/alpha");
-        let src_dirs = crate_src_dirs(&ws);
+        let src_dirs = crate_dirs(&ws);
         let whitelist = HashSet::new();
-        let result = analyze_crate(&crate_path, &src_dirs, &whitelist).unwrap();
+        let result = analyze_crate(&crate_path, &src_dirs, &whitelist, &|_| {}).unwrap();
 
         let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
 
@@ -1144,12 +2964,12 @@ pub fn other() {}
             "alpha",
             &[("lib.rs", "pub fn whitelisted_fn() {}\n")],
         )]);
-        let src_dirs = crate_src_dirs(&ws);
+        let src_dirs = crate_dirs(&ws);
         let mut whitelist = HashSet::new();
         whitelist.insert(("whitelisted_fn".to_string(), "alpha".to_string()));
 
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &|_| {}).unwrap();
         assert!(result.unused.is_empty());
     }
 
@@ -1170,6 +2990,7 @@ pub fn other() {}
             },
             kind: SymbolKind::CrateInternalOnly { refs: 3 },
             crate_name: "alpha".to_string(),
+            internal_refs: vec![],
         };
         apply_fix_crate_internal(&sym).unwrap();
 
@@ -1201,6 +3022,7 @@ pub fn also_keep() {}
             },
             kind: SymbolKind::UnusedAnywhere,
             crate_name: "alpha".to_string(),
+            internal_refs: vec![],
         };
 
         let _preview = apply_fix_unused(&sym).unwrap();
@@ -1233,6 +3055,7 @@ pub fn also_keep() {}
             },
             kind: SymbolKind::UnusedAnywhere,
             crate_name: "alpha".to_string(),
+            internal_refs: vec![],
         };
 
         let _preview = apply_fix_unused(&sym).unwrap();
@@ -1260,11 +3083,223 @@ pub fn keep() {}
             },
             kind: SymbolKind::UnusedAnywhere,
             crate_name: "alpha".to_string(),
+            internal_refs: vec![],
         };
 
         let _preview = apply_fix_unused(&sym).unwrap();
         let result = fs::read_to_string(&file).unwrap();
         assert!(!result.contains("UNUSED_CONST"));
         assert!(result.contains("keep"));
+    }
+
+    // -- graphql exemption ---------------------------------------------------
+
+    #[test]
+    fn graphql_object_impl_methods_exempt() {
+        let source = "\
+#[Object]
+impl MyQuery {
+    pub async fn resolver(&self) -> String {
+        todo!()
+    }
+}
+";
+        // pub async fn resolver is on line 2 (0-indexed)
+        assert!(is_graphql_exempt(source, 2));
+    }
+
+    #[test]
+    fn graphql_derive_simple_object_exempt() {
+        let source = "\
+#[derive(SimpleObject)]
+pub struct Output {
+    pub name: String,
+}
+";
+        // pub struct Output is on line 1 (0-indexed)
+        assert!(is_graphql_exempt(source, 1));
+    }
+
+    #[test]
+    fn non_graphql_items_not_exempt() {
+        let source = "\
+#[derive(Debug)]
+pub struct Regular {
+    pub field: i32,
+}
+";
+        assert!(!is_graphql_exempt(source, 1));
+    }
+
+    #[test]
+    fn graphql_mutation_impl_methods_exempt() {
+        let source = "\
+#[Mutation]
+impl MyMutation {
+    pub async fn create_thing(&self) -> bool {
+        true
+    }
+}
+";
+        assert!(is_graphql_exempt(source, 2));
+    }
+
+    #[test]
+    fn collect_skips_graphql_items() {
+        let ws = create_workspace(&[(
+            "alpha",
+            &[(
+                "lib.rs",
+                concat!(
+                    "#[derive(SimpleObject)]\n",
+                    "pub struct GqlOutput {\n",
+                    "    pub name: String,\n",
+                    "}\n",
+                    "\n",
+                    "pub fn regular_fn() {}\n",
+                ),
+            )],
+        )]);
+        let (symbols, _skipped) = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
+        let (kept, skipped) = filter_graphql_exempt(symbols);
+        let kept_names: Vec<&str> = kept.iter().map(|s| s.name.as_str()).collect();
+        assert!(kept_names.contains(&"regular_fn"));
+        assert!(!kept_names.contains(&"GqlOutput"));
+        assert!(skipped.iter().any(|(name, reason)| name == "GqlOutput" && *reason == SkipReason::Graphql));
+    }
+
+    // -- derive_builder aliases ----------------------------------------------
+
+    #[test]
+    fn detect_builder_alias() {
+        let source = "\
+#[derive(Builder, Debug)]
+#[builder(pattern = \"owned\")]
+pub struct MyConfig {
+    pub name: String,
+}
+";
+        assert!(has_derive_builder(source, 2)); // pub struct line, 0-indexed
+    }
+
+    #[test]
+    fn no_builder_no_alias() {
+        let source = "\
+#[derive(Debug)]
+pub struct Plain {
+    pub field: i32,
+}
+";
+        assert!(!has_derive_builder(source, 1));
+    }
+
+    #[test]
+    fn builder_used_externally_via_alias() {
+        // alpha defines a struct with derive(Builder)
+        // beta uses MyConfigBuilder (the generated builder type)
+        // → alpha::MyConfig should NOT be reported as unused
+        let ws = create_workspace(&[
+            (
+                "alpha",
+                &[(
+                    "lib.rs",
+                    "#[derive(Builder)]\npub struct MyConfig {\n    pub name: String,\n}\n",
+                )],
+            ),
+            (
+                "beta",
+                &[(
+                    "lib.rs",
+                    "fn consumer() {\n    let _b = MyConfigBuilder::default();\n}\n",
+                )],
+            ),
+        ]);
+        let src_dirs = crate_dirs(&ws);
+        let whitelist = HashSet::new();
+        let result =
+            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &|_| {}).unwrap();
+
+        let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
+        // MyConfig should not be unused because MyConfigBuilder is referenced externally
+        assert!(find("MyConfig").is_none());
+    }
+
+    #[test]
+    fn builder_unused_everywhere_still_reported() {
+        // alpha defines a struct with derive(Builder)
+        // nobody uses MyConfig or MyConfigBuilder
+        let ws = create_workspace(&[
+            (
+                "alpha",
+                &[(
+                    "lib.rs",
+                    "#[derive(Builder)]\npub struct MyConfig {\n    pub name: String,\n}\n",
+                )],
+            ),
+            ("beta", &[("lib.rs", "fn consumer() {}\n")]),
+        ]);
+        let src_dirs = crate_dirs(&ws);
+        let whitelist = HashSet::new();
+        let result =
+            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &|_| {}).unwrap();
+
+        let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
+        // MyConfig should be reported as unused since neither it nor MyConfigBuilder is used
+        assert!(find("MyConfig").is_some());
+    }
+
+    // -- tests/ directory search coverage ------------------------------------
+
+    /// Helper: add a tests/ file to a crate in a workspace
+    fn add_test_file(tmp: &TempDir, crate_name: &str, filename: &str, content: &str) {
+        let tests_dir = tmp.path().join("crates").join(crate_name).join("tests");
+        fs::create_dir_all(&tests_dir).unwrap();
+        fs::write(tests_dir.join(filename), content).unwrap();
+    }
+
+    #[test]
+    fn symbol_used_in_tests_dir_not_unused() {
+        // alpha defines a pub fn, beta's tests/ dir uses it
+        let ws = create_workspace(&[
+            ("alpha", &[("lib.rs", "pub fn test_helper() {}\n")]),
+            ("beta", &[("lib.rs", "// nothing here\n")]),
+        ]);
+        add_test_file(&ws, "beta", "integration.rs", "fn it_works() { test_helper(); }\n");
+
+        let dirs = crate_dirs(&ws);
+        let whitelist = HashSet::new();
+        let result =
+            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &whitelist, &|_| {}).unwrap();
+
+        let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
+        // test_helper is used in beta's tests/ → should NOT be reported
+        assert!(find("test_helper").is_none());
+    }
+
+    #[test]
+    fn internal_refs_populated_for_crate_internal() {
+        let ws = create_workspace(&[(
+            "alpha",
+            &[(
+                "lib.rs",
+                concat!(
+                    "pub fn used_internally() { used_internally_helper(); }\n",
+                    "fn used_internally_helper() { used_internally(); }\n",
+                ),
+            )],
+        )]);
+        let dirs = crate_dirs(&ws);
+        let whitelist = HashSet::new();
+        let result =
+            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &whitelist, &|_| {}).unwrap();
+
+        let item = result
+            .unused
+            .iter()
+            .find(|u| u.symbol.name == "used_internally")
+            .expect("should be crate-internal");
+        assert!(matches!(item.kind, SymbolKind::CrateInternalOnly { .. }));
+        // Should have internal_refs (the non-definition usage sites)
+        assert!(!item.internal_refs.is_empty());
     }
 }
