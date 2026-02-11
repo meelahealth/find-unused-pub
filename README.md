@@ -1,6 +1,6 @@
 # find-unused-pub
 
-Find `pub` items in a Rust workspace that are either unused entirely or only used within their own crate.
+Find `pub` items in a Rust workspace that are either unused entirely or only used within their own crate. Ships with a full TUI (ratatui + catppuccin) for browsing results, reviewing items interactively, and applying fixes.
 
 ## Install
 
@@ -19,11 +19,20 @@ cargo build --release
 Run from anywhere inside a Rust workspace (it walks up to find the root `Cargo.toml` with `[workspace]`):
 
 ```bash
-# Scan all crates
+# Scan all crates — launches the TUI
 find-unused-pub
 
 # Scan specific crates
 find-unused-pub crates/auth crates/core
+
+# Ignore a crate
+find-unused-pub --ignore crates/app
+
+# Disable the graphql filter (faster if you don't use async-graphql)
+find-unused-pub --disable-filter graphql
+
+# Use a different catppuccin palette
+find-unused-pub --palette latte
 
 # Auto-fix crate-internal items → pub(crate)
 find-unused-pub --fix crates/auth
@@ -31,14 +40,8 @@ find-unused-pub --fix crates/auth
 # Auto-fix unused items (deletes the entire item)
 find-unused-pub --fix-unused
 
-# Fix both categories at once
-find-unused-pub --fix --fix-unused
-
 # Interactively review unused items (fix / whitelist / skip)
 find-unused-pub --review
-
-# Interactively review crate-internal items
-find-unused-pub --review-crate-internal
 
 # Clear the whitelist database
 find-unused-pub --nuke-whitelist
@@ -48,6 +51,9 @@ find-unused-pub --nuke-whitelist
 
 | Flag | Description |
 |------|-------------|
+| `--palette <name>` | Catppuccin theme: `latte`, `frappe`, `macchiato`, `mocha` (default) |
+| `--ignore <path>` | Skip a crate path (repeatable, relative to workspace root) |
+| `--disable-filter <name>` | Turn off a filter plugin (repeatable, see [Filters](#filters)) |
 | `--fix` | Alias for `--fix-crate-internal` |
 | `--fix-crate-internal` | Auto-fix crate-internal items to `pub(crate)` |
 | `--fix-unused` | Auto-fix unused items by deleting them entirely |
@@ -58,14 +64,61 @@ find-unused-pub --nuke-whitelist
 
 Flags compose: `--fix --fix-unused` fixes both categories.
 
+## Environment variables
+
+Set these in your `.envrc` or shell profile to avoid repeating flags:
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `FIND_UNUSED_PUB_PALETTE` | `latte` | Initial catppuccin palette |
+| `FIND_UNUSED_PUB_IGNORE` | `crates/app,crates/cli` | Comma-separated crate paths to skip |
+| `FIND_UNUSED_PUB_DISABLE_FILTER` | `graphql` | Comma-separated filter names to disable |
+
+CLI flags override environment variables when both are set.
+
+## TUI
+
+The default mode launches an interactive TUI with three phases:
+
+1. **Scanning** — streams results as each crate is analyzed, showing live progress
+2. **Summary** — three views (Tab to switch): table overview, per-crate detail (collapsible), and skipped symbols (collapsible)
+3. **Review** — step through each item with git blame/log context, choose fix / allowlist / skip
+
+### Keybindings
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Cycle summary views (table / detail / skipped) |
+| `j` / `k` | Scroll or navigate crates |
+| `Space` | Expand/collapse a crate in detail/skipped view |
+| `p` | Cycle catppuccin palette live |
+| `q` | Quit |
+| `r` | Review unused items |
+| `i` | Review crate-internal items |
+| `f` / `a` / `s` | Fix / Allowlist / Skip (in review) |
+
+The TUI title bar and config block show the active palette, enabled filters, disabled filters, and ignored paths — always self-documenting.
+
+## Filters
+
+Filters are modular plugins that exempt symbols from analysis. All ship enabled by default (batteries included). Disable any with `--disable-filter <name>`.
+
+| Filter | What it does |
+|--------|--------------|
+| `orm` | Skips sea-orm derive names: `Model`, `Entity`, `Column`, `Relation`, `ActiveModel`, `ActiveModelBehavior` |
+| `graphql` | Skips items with async-graphql attributes: `#[Object]`, `#[derive(SimpleObject)]`, `#[Mutation]`, etc. Shows the specific attribute in the TUI (e.g. `[graphql:SimpleObject]`) |
+| `builder` | Detects `#[derive(Builder)]` and searches for `{Name}Builder` aliases so builder-pattern structs aren't falsely reported |
+
 ## How it works
 
 1. Scans each crate's `src/` for `pub fn|struct|enum|trait|type|const|static` definitions
-2. Batch-searches all other crates for word-bounded matches (using ripgrep as a library)
-3. For symbols with zero external hits, checks internal usage within the same crate
-4. Classifies each symbol:
-   - **unused anywhere** (red) - no references beyond the definition itself
-   - **crate-internal only** (yellow) - used inside the crate but never externally
+2. Runs active filter plugins to exempt framework-used symbols
+3. Batch-searches all other crates for word-bounded matches (ripgrep as a library)
+4. For symbols with zero external hits, checks internal usage within the same crate
+5. Classifies each symbol:
+   - **unused anywhere** — no references beyond the definition itself
+   - **crate-internal only** — used inside the crate but never externally
+6. Comment-only lines (`// ...`) are ignored during reference counting
 
 Uses [tree-sitter-rust](https://github.com/tree-sitter/tree-sitter-rust) for accurate item span detection when deleting items (includes doc comments, attributes, and the full item body).
 
@@ -79,7 +132,7 @@ False positives can be whitelisted during `--review` mode. The whitelist is stor
 - May false-positive on items used only via trait impls or proc macros
 - Skips `pub(crate)`, `pub(super)`, and `pub(in ...)` (already scoped)
 - Skips `pub mod` (modules are structural)
-- Skips ORM-derived symbols (`Model`, `Entity`, `Column`, `Relation`, `ActiveModel`, `ActiveModelBehavior`)
+- Block comments (`/* */`) are not skipped during reference counting (only `//` lines)
 
 ## Tests
 
