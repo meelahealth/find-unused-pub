@@ -159,7 +159,7 @@ struct UnusedSymbol {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkipReason {
-    Graphql,
+    Graphql(&'static str),
     Orm,
 }
 
@@ -473,14 +473,15 @@ const SKIP_SYMBOLS: &[&str] = &[
 ];
 
 /// async-graphql attributes that mark items as framework-used.
+/// Ordered longest-first so that `contains("Object")` doesn't shadow `SimpleObject`.
 const GRAPHQL_ATTRS: &[&str] = &[
-    "Object",
     "SimpleObject",
     "MergedObject",
     "InputObject",
-    "Mutation",
     "Subscription",
     "Interface",
+    "Mutation",
+    "Object",
     "Union",
 ];
 
@@ -1006,28 +1007,28 @@ fn find_item_at_line<'a>(
 
 /// Check if a pub symbol at `line` (0-indexed) is exempt from unused detection
 /// because it has async-graphql attributes (directly or via parent impl block).
-fn is_graphql_exempt(source: &str, line: usize) -> bool {
+fn is_graphql_exempt(source: &str, line: usize) -> Option<&'static str> {
     let mut parser = tree_sitter::Parser::new();
     if parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .is_err()
     {
-        return false;
+        return None;
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return false,
+        None => return None,
     };
     let root = tree.root_node();
 
     let item = match find_item_at_line(root, line) {
         Some(i) => i,
-        None => return false,
+        None => return None,
     };
 
     // Check direct attributes on the item (e.g. #[derive(SimpleObject)])
-    if node_has_graphql_attr(item, source) {
-        return true;
+    if let Some(attr) = node_has_graphql_attr(item, source) {
+        return Some(attr);
     }
 
     // If inside an impl block, check the impl block's attributes (e.g. #[Object])
@@ -1039,11 +1040,11 @@ fn is_graphql_exempt(source: &str, line: usize) -> bool {
         parent = p.parent();
     }
 
-    false
+    None
 }
 
 /// Check if a node's preceding sibling attributes contain any GRAPHQL_ATTRS.
-fn node_has_graphql_attr(node: tree_sitter::Node, source: &str) -> bool {
+fn node_has_graphql_attr(node: tree_sitter::Node, source: &str) -> Option<&'static str> {
     let mut sibling = node.prev_sibling();
     while let Some(s) = sibling {
         match s.kind() {
@@ -1051,7 +1052,7 @@ fn node_has_graphql_attr(node: tree_sitter::Node, source: &str) -> bool {
                 let text = &source[s.start_byte()..s.end_byte()];
                 for attr in GRAPHQL_ATTRS {
                     if text.contains(attr) {
-                        return true;
+                        return Some(attr);
                     }
                 }
             }
@@ -1060,7 +1061,7 @@ fn node_has_graphql_attr(node: tree_sitter::Node, source: &str) -> bool {
         }
         sibling = s.prev_sibling();
     }
-    false
+    None
 }
 
 /// Filter out symbols that are exempt due to async-graphql attributes.
@@ -1076,8 +1077,8 @@ fn filter_graphql_exempt(symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(Strin
                 continue;
             }
         };
-        if is_graphql_exempt(&source, sym.line - 1) {
-            skipped.push((sym.name, SkipReason::Graphql));
+        if let Some(attr) = is_graphql_exempt(&source, sym.line - 1) {
+            skipped.push((sym.name, SkipReason::Graphql(attr)));
         } else {
             kept.push(sym);
         }
@@ -2312,7 +2313,7 @@ fn draw_summary_skipped(
         if is_expanded {
             for (name, reason) in &result.skipped {
                 let reason_label = match reason {
-                    SkipReason::Graphql => Span::styled(" [graphql]", Style::default().fg(ctp(flavor().mauve))),
+                    SkipReason::Graphql(attr) => Span::styled(format!(" [graphql:{attr}]"), Style::default().fg(ctp(flavor().mauve))),
                     SkipReason::Orm => Span::styled(" [orm]", Style::default().fg(ctp(flavor().teal))),
                 };
                 lines.push(Line::from(vec![
@@ -3151,7 +3152,7 @@ impl MyQuery {
 }
 ";
         // pub async fn resolver is on line 2 (0-indexed)
-        assert!(is_graphql_exempt(source, 2));
+        assert_eq!(is_graphql_exempt(source, 2), Some("Object"));
     }
 
     #[test]
@@ -3163,7 +3164,7 @@ pub struct Output {
 }
 ";
         // pub struct Output is on line 1 (0-indexed)
-        assert!(is_graphql_exempt(source, 1));
+        assert_eq!(is_graphql_exempt(source, 1), Some("SimpleObject"));
     }
 
     #[test]
@@ -3174,7 +3175,7 @@ pub struct Regular {
     pub field: i32,
 }
 ";
-        assert!(!is_graphql_exempt(source, 1));
+        assert_eq!(is_graphql_exempt(source, 1), None);
     }
 
     #[test]
@@ -3187,7 +3188,7 @@ impl MyMutation {
     }
 }
 ";
-        assert!(is_graphql_exempt(source, 2));
+        assert_eq!(is_graphql_exempt(source, 2), Some("Mutation"));
     }
 
     #[test]
@@ -3211,7 +3212,7 @@ impl MyMutation {
         let kept_names: Vec<&str> = kept.iter().map(|s| s.name.as_str()).collect();
         assert!(kept_names.contains(&"regular_fn"));
         assert!(!kept_names.contains(&"GqlOutput"));
-        assert!(skipped.iter().any(|(name, reason)| name == "GqlOutput" && *reason == SkipReason::Graphql));
+        assert!(skipped.iter().any(|(name, reason)| name == "GqlOutput" && *reason == SkipReason::Graphql("SimpleObject")));
     }
 
     // -- derive_builder aliases ----------------------------------------------
