@@ -1805,10 +1805,10 @@ fn run_tui_main_loop(
                             return Ok(());
                         }
                         match key.code {
-                            KeyCode::Char('j') | KeyCode::Down => {
+                            KeyCode::PageDown | KeyCode::Char('j') | KeyCode::Down => {
                                 app.detail_scroll = app.detail_scroll.saturating_add(1);
                             }
-                            KeyCode::Char('k') | KeyCode::Up => {
+                            KeyCode::PageUp | KeyCode::Char('k') | KeyCode::Up => {
                                 app.detail_scroll = app.detail_scroll.saturating_sub(1);
                             }
                             KeyCode::Char('p') => {
@@ -1846,30 +1846,34 @@ fn run_tui_main_loop(
                                         let max = app.results.iter().filter(|r| !r.unused.is_empty()).count();
                                         if app.detail_cursor < max.saturating_sub(1) {
                                             app.detail_cursor += 1;
+                                            app.detail_scroll = 0;
                                         }
                                     }
                                     SummaryView::Skipped => {
                                         let max = app.results.iter().filter(|r| !r.skipped.is_empty()).count();
                                         if app.skipped_cursor < max.saturating_sub(1) {
                                             app.skipped_cursor += 1;
+                                            app.detail_scroll = 0;
                                         }
                                     }
-                                    _ => {
-                                        app.detail_scroll = app.detail_scroll.saturating_add(1);
-                                    }
+                                    _ => {}
                                 }
                             }
                             KeyCode::Char('k') => {
                                 match app.summary_view {
                                     SummaryView::Detail => {
-                                        app.detail_cursor = app.detail_cursor.saturating_sub(1);
+                                        if app.detail_cursor > 0 {
+                                            app.detail_cursor -= 1;
+                                            app.detail_scroll = 0;
+                                        }
                                     }
                                     SummaryView::Skipped => {
-                                        app.skipped_cursor = app.skipped_cursor.saturating_sub(1);
+                                        if app.skipped_cursor > 0 {
+                                            app.skipped_cursor -= 1;
+                                            app.detail_scroll = 0;
+                                        }
                                     }
-                                    _ => {
-                                        app.detail_scroll = app.detail_scroll.saturating_sub(1);
-                                    }
+                                    _ => {}
                                 }
                             }
                             KeyCode::Char(' ') => {
@@ -1908,6 +1912,12 @@ fn run_tui_main_loop(
                                 if app.summary_selected < menu.len().saturating_sub(1) {
                                     app.summary_selected += 1;
                                 }
+                            }
+                            KeyCode::PageDown => {
+                                app.detail_scroll = app.detail_scroll.saturating_add(1);
+                            }
+                            KeyCode::PageUp => {
+                                app.detail_scroll = app.detail_scroll.saturating_sub(1);
                             }
                             KeyCode::Enter => {
                                 if let Some((action, _)) = menu.get(app.summary_selected) {
@@ -2400,7 +2410,7 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ctp(flavor().surface2)))
-                .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, j/k: scroll, p: palette, q: quit) ")
+                .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, PgUp/PgDn: scroll, p: palette, q: quit) ")
                 .title_style(Style::default().fg(ctp(flavor().peach))),
         )
         .highlight_symbol("▸ ");
@@ -2543,7 +2553,7 @@ fn draw_summary_detail(
             Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled("j/k: navigate crates, Space: expand/collapse", dim),
+        Span::styled("j/k: navigate crates, PgUp/PgDn: scroll, Space: expand/collapse", dim),
     ]));
     lines.push(Line::raw(""));
 
@@ -2655,6 +2665,7 @@ fn draw_summary_detail(
     }
 
     let detail_widget = Paragraph::new(Text::from(lines))
+        .scroll((app.detail_scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2684,7 +2695,7 @@ fn draw_summary_skipped(
         Span::styled(format!("({})", active_filter_names().join(", ")), dim),
     ]));
     lines.push(Line::from(Span::styled(
-        "j/k: navigate crates, Space: expand/collapse",
+        "j/k: navigate crates, PgUp/PgDn: scroll, Space: expand/collapse",
         dim,
     )));
     lines.push(Line::raw(""));
@@ -2748,6 +2759,7 @@ fn draw_summary_skipped(
     }
 
     let widget = Paragraph::new(Text::from(lines))
+        .scroll((app.detail_scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
