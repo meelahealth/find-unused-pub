@@ -247,9 +247,9 @@ struct Args {
     #[arg(long)]
     fix: bool,
 
-    /// Clear the whitelist database
+    /// Clear the allowlist database
     #[arg(long)]
-    nuke_whitelist: bool,
+    nuke_allowlist: bool,
 
     /// Ignore crate paths (relative to workspace root, repeatable)
     #[arg(long, env = "FIND_UNUSED_PUB_IGNORE", value_delimiter = ',')]
@@ -1023,7 +1023,7 @@ fn find_symbol_locations(
 fn analyze_crate(
     crate_path: &Path,
     all_crate_dirs: &[PathBuf],
-    whitelist: &HashSet<(String, String)>,
+    allowlist: &HashSet<(String, String)>,
     filters: &[Box<dyn SymbolFilter>],
     on_progress: &dyn Fn(&str),
 ) -> Result<CrateResult> {
@@ -1109,8 +1109,8 @@ fn analyze_crate(
     // Classify
     let mut unused = vec![];
     for sym in no_external {
-        // Check whitelist
-        if whitelist.contains(&(sym.name.clone(), crate_name.clone())) {
+        // Check allowlist
+        if allowlist.contains(&(sym.name.clone(), crate_name.clone())) {
             continue;
         }
 
@@ -1158,14 +1158,14 @@ fn analyze_crate(
 }
 
 // ---------------------------------------------------------------------------
-// Whitelist DB
+// Allowlist DB
 // ---------------------------------------------------------------------------
 
 fn open_db(workspace_root: &Path) -> Result<Connection> {
     let path = workspace_root.join(".find-unused-pub.db");
     let conn = Connection::open(&path)?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS whitelist (
+        "CREATE TABLE IF NOT EXISTS allowlist (
             symbol TEXT NOT NULL,
             crate_name TEXT NOT NULL,
             file_path TEXT NOT NULL,
@@ -1177,8 +1177,8 @@ fn open_db(workspace_root: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn load_whitelist(conn: &Connection) -> Result<HashSet<(String, String)>> {
-    let mut stmt = conn.prepare("SELECT symbol, crate_name FROM whitelist")?;
+fn load_allowlist(conn: &Connection) -> Result<HashSet<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT symbol, crate_name FROM allowlist")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -1189,7 +1189,7 @@ fn load_whitelist(conn: &Connection) -> Result<HashSet<(String, String)>> {
     Ok(set)
 }
 
-fn add_to_whitelist(
+fn add_to_allowlist(
     conn: &Connection,
     symbol: &str,
     crate_name: &str,
@@ -1197,16 +1197,16 @@ fn add_to_whitelist(
     reason: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO whitelist (symbol, crate_name, file_path, reason) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO allowlist (symbol, crate_name, file_path, reason) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![symbol, crate_name, file_path, reason],
     )?;
     Ok(())
 }
 
-fn nuke_whitelist(conn: &Connection) -> Result<()> {
-    conn.execute_batch("DROP TABLE IF EXISTS whitelist;")?;
+fn nuke_allowlist(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS allowlist;")?;
     conn.execute_batch(
-        "CREATE TABLE whitelist (
+        "CREATE TABLE allowlist (
             symbol TEXT NOT NULL,
             crate_name TEXT NOT NULL,
             file_path TEXT NOT NULL,
@@ -2240,7 +2240,7 @@ fn finish_review(app: &mut App) -> Result<()> {
                     }
                 },
                 ReviewAction::Allowlist => {
-                    add_to_whitelist(
+                    add_to_allowlist(
                         &app.conn,
                         &item.symbol.name,
                         &item.crate_name,
@@ -3179,11 +3179,11 @@ async fn main() -> Result<()> {
     let workspace_root = find_workspace_root()?;
     let crates_dir = workspace_root.join("crates");
 
-    // Handle --nuke-whitelist
+    // Handle --nuke-allowlist
     let conn = open_db(&workspace_root)?;
-    if args.nuke_whitelist {
-        nuke_whitelist(&conn)?;
-        eprintln!("{}", "Whitelist cleared.".green());
+    if args.nuke_allowlist {
+        nuke_allowlist(&conn)?;
+        eprintln!("{}", "Allowlist cleared.".green());
         if args.crate_paths.is_empty()
             && !args.should_fix_crate_internal()
             && !args.fix_unused
@@ -3192,7 +3192,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let whitelist = load_whitelist(&conn)?;
+    let allowlist = load_allowlist(&conn)?;
 
     // Resolve crate paths
     let mut target_crates: Vec<PathBuf> = if args.crate_paths.is_empty() {
@@ -3250,7 +3250,7 @@ async fn main() -> Result<()> {
         for crate_path in &target_crates {
             let crate_path = crate_path.clone();
             let all_dirs = all_crate_dirs.clone();
-            let wl = whitelist.clone();
+            let wl = allowlist.clone();
             let f = filters.clone();
             handles.push(tokio::task::spawn_blocking(move || {
                 analyze_crate(&crate_path, &all_dirs, &wl, &f, &|_| {})
@@ -3302,7 +3302,7 @@ async fn main() -> Result<()> {
         for crate_path in &target_crates {
             let crate_path = crate_path.clone();
             let all_dirs = all_crate_dirs.clone();
-            let wl = whitelist.clone();
+            let wl = allowlist.clone();
             let f = filters.clone();
             handles.push(tokio::task::spawn_blocking(move || {
                 analyze_crate(&crate_path, &all_dirs, &wl, &f, &|_| {})
@@ -3362,7 +3362,7 @@ async fn main() -> Result<()> {
     for (idx, crate_path) in target_crates.iter().enumerate() {
         let crate_path = crate_path.clone();
         let all_dirs = all_crate_dirs.clone();
-        let wl = whitelist.clone();
+        let wl = allowlist.clone();
         let tx = scan_tx.clone();
         let f = filters.clone();
         tokio::task::spawn_blocking(move || {
@@ -3611,8 +3611,8 @@ pub fn other() {}
         ]);
         let crate_path = ws.path().join("crates/alpha");
         let src_dirs = crate_dirs(&ws);
-        let whitelist = HashSet::new();
-        let result = analyze_crate(&crate_path, &src_dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
+        let allowlist = HashSet::new();
+        let result = analyze_crate(&crate_path, &src_dirs, &allowlist, &all_filters(), &|_| {}).unwrap();
 
         let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
 
@@ -3629,17 +3629,17 @@ pub fn other() {}
     }
 
     #[test]
-    fn analyze_respects_whitelist() {
+    fn analyze_respects_allowlist() {
         let ws = create_workspace(&[(
             "alpha",
-            &[("lib.rs", "pub fn whitelisted_fn() {}\n")],
+            &[("lib.rs", "pub fn allowlisted_fn() {}\n")],
         )]);
         let src_dirs = crate_dirs(&ws);
-        let mut whitelist = HashSet::new();
-        whitelist.insert(("whitelisted_fn".to_string(), "alpha".to_string()));
+        let mut allowlist = HashSet::new();
+        allowlist.insert(("allowlisted_fn".to_string(), "alpha".to_string()));
 
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &allowlist, &all_filters(), &|_| {}).unwrap();
         assert!(result.unused.is_empty());
     }
 
@@ -3886,9 +3886,9 @@ pub struct Plain {
             ),
         ]);
         let src_dirs = crate_dirs(&ws);
-        let whitelist = HashSet::new();
+        let allowlist = HashSet::new();
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &allowlist, &all_filters(), &|_| {}).unwrap();
 
         let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
         // MyConfig should not be unused because MyConfigBuilder is referenced externally
@@ -3910,9 +3910,9 @@ pub struct Plain {
             ("beta", &[("lib.rs", "fn consumer() {}\n")]),
         ]);
         let src_dirs = crate_dirs(&ws);
-        let whitelist = HashSet::new();
+        let allowlist = HashSet::new();
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &allowlist, &all_filters(), &|_| {}).unwrap();
 
         let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
         // MyConfig should be reported as unused since neither it nor MyConfigBuilder is used
@@ -3938,9 +3938,9 @@ pub struct Plain {
         add_test_file(&ws, "beta", "integration.rs", "fn it_works() { test_helper(); }\n");
 
         let dirs = crate_dirs(&ws);
-        let whitelist = HashSet::new();
+        let allowlist = HashSet::new();
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &allowlist, &all_filters(), &|_| {}).unwrap();
 
         let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
         // test_helper is used in beta's tests/ → should NOT be reported
@@ -3960,9 +3960,9 @@ pub struct Plain {
             )],
         )]);
         let dirs = crate_dirs(&ws);
-        let whitelist = HashSet::new();
+        let allowlist = HashSet::new();
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &allowlist, &all_filters(), &|_| {}).unwrap();
 
         let item = result
             .unused
@@ -3993,12 +3993,12 @@ pub struct Plain {
             )],
         )]);
         let dirs = crate_dirs(&ws);
-        let whitelist = HashSet::new();
+        let allowlist = HashSet::new();
         let no_graphql = active_filters(&["graphql".to_string()], &[]);
         let result = analyze_crate(
             &ws.path().join("crates/alpha"),
             &dirs,
-            &whitelist,
+            &allowlist,
             &no_graphql,
             &|_| {},
         )
@@ -4017,12 +4017,12 @@ pub struct Plain {
             &[("lib.rs", "pub struct Model {}\npub struct Entity {}\n")],
         )]);
         let dirs = crate_dirs(&ws);
-        let whitelist = HashSet::new();
+        let allowlist = HashSet::new();
         let no_orm = active_filters(&["orm".to_string()], &[]);
         let result = analyze_crate(
             &ws.path().join("crates/alpha"),
             &dirs,
-            &whitelist,
+            &allowlist,
             &no_orm,
             &|_| {},
         )
@@ -4053,11 +4053,11 @@ pub struct Plain {
             ("beta", &[("lib.rs", "// foo()\n")]),
         ]);
         let dirs = crate_dirs(&ws);
-        let whitelist = HashSet::new();
+        let allowlist = HashSet::new();
         let result = analyze_crate(
             &ws.path().join("crates/alpha"),
             &dirs,
-            &whitelist,
+            &allowlist,
             &all_filters(),
             &|_| {},
         )
@@ -4079,11 +4079,11 @@ pub struct Plain {
             ("beta", &[("lib.rs", "fn use_it() { bar(); } // call bar\n")]),
         ]);
         let dirs = crate_dirs(&ws);
-        let whitelist = HashSet::new();
+        let allowlist = HashSet::new();
         let result = analyze_crate(
             &ws.path().join("crates/alpha"),
             &dirs,
-            &whitelist,
+            &allowlist,
             &all_filters(),
             &|_| {},
         )

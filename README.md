@@ -44,8 +44,8 @@ find-unused-pub --fix crates/auth
 # Auto-fix unused items (deletes the entire item)
 find-unused-pub --fix-unused
 
-# Clear the whitelist database
-find-unused-pub --nuke-whitelist
+# Clear the allowlist database
+find-unused-pub --nuke-allowlist
 ```
 
 ## Flags
@@ -59,7 +59,7 @@ find-unused-pub --nuke-whitelist
 | `--fix` | Alias for `--fix-crate-internal` |
 | `--fix-crate-internal` | Auto-fix crate-internal items to `pub(crate)` |
 | `--fix-unused` | Auto-fix unused items by deleting them entirely |
-| `--nuke-whitelist` | Clear the SQLite whitelist database |
+| `--nuke-allowlist` | Clear the SQLite allowlist database |
 
 Flags compose: `--fix --fix-unused` fixes both categories.
 
@@ -131,9 +131,9 @@ Filters are modular plugins that exempt symbols from analysis. Most ship enabled
 
 Uses [tree-sitter-rust](https://github.com/tree-sitter/tree-sitter-rust) for accurate item span detection when deleting items (includes doc comments, attributes, and the full item body).
 
-## Whitelist
+## Allowlist
 
-False positives can be whitelisted during `--review` mode. The whitelist is stored in a SQLite database at `.find-unused-pub.db` in the workspace root (gitignored).
+False positives can be allowlisted during review mode. The allowlist is stored in a SQLite database at `.find-unused-pub.db` in the workspace root (gitignored).
 
 ## Caveats
 
