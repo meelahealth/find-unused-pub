@@ -89,7 +89,8 @@ The default mode launches an interactive TUI with three phases:
 | Key | Action |
 |-----|--------|
 | `Tab` | Cycle summary views (table / detail / skipped) |
-| `j` / `k` | Scroll or navigate crates |
+| `j` / `k` | Navigate crates (detail/skipped views) |
+| `PgUp` / `PgDn` | Scroll content |
 | `Space` | Expand/collapse a crate in detail/skipped view |
 | `p` | Cycle palette live |
 | `q` | Quit |

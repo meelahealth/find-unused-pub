@@ -1881,10 +1881,10 @@ fn run_tui_main_loop(
                             return Ok(());
                         }
                         match key.code {
-                            KeyCode::PageDown | KeyCode::Char('j') | KeyCode::Down => {
+                            KeyCode::PageDown => {
                                 app.detail_scroll = app.detail_scroll.saturating_add(1);
                             }
-                            KeyCode::PageUp | KeyCode::Char('k') | KeyCode::Up => {
+                            KeyCode::PageUp => {
                                 app.detail_scroll = app.detail_scroll.saturating_sub(1);
                             }
                             KeyCode::Char('p') => {
@@ -2078,11 +2078,11 @@ fn run_tui_main_loop(
                                         review.selected_action += 1;
                                     }
                                 }
-                                KeyCode::Char('j') => {
+                                KeyCode::PageDown => {
                                     review.scroll_offset =
                                         review.scroll_offset.saturating_add(1);
                                 }
-                                KeyCode::Char('k') => {
+                                KeyCode::PageUp => {
                                     review.scroll_offset =
                                         review.scroll_offset.saturating_sub(1);
                                 }
@@ -3128,7 +3128,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme().outline))
-                .title(" ⚡ Action (f/a/s or ↑↓+Enter, j/k scroll, q quit) ")
+                .title(" ⚡ Action (f/a/s or ↑↓+Enter, PgUp/PgDn: scroll, p: palette, q: quit) ")
                 .title_style(Style::default().fg(theme().tertiary))
                 .title_bottom(palette_swatch()),
         )
