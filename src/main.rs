@@ -323,17 +323,24 @@ fn eq_noise(seed: u32) -> f64 {
 }
 
 /// Wave A: returns 0.0–1.0 for a given horizontal position and tick.
+/// Uses irrational-ratio spatial frequencies so the pattern never visibly repeats,
+/// plus a per-column phase shift for micro-variation across the width.
 fn eq_wave_a(x: f64, tick: u16) -> f64 {
     let tf = tick as f64;
     let xi = x as u32;
     let ti = tick as u32;
+    // Per-column phase micro-shift: smooth, deterministic, breaks repetition.
+    let phase = eq_noise(xi.wrapping_mul(2017)) * std::f64::consts::TAU;
     let beat = ((tf * 0.52).sin() * 0.5 + 0.5)
         * ((tf * 1.3).sin() * 0.3 + 0.7);
-    let base = (x * 0.3 + tf * 0.5).sin() * 0.2
-        + (x * 0.8 - tf * 0.35).sin() * 0.15
-        + (x * 1.7 + tf * 0.7).sin() * 0.12
-        + (x * 3.1 - tf * 0.9).cos() * 0.08
-        + (x * 5.0 + tf * 1.2).sin() * 0.06;
+    // Spatial frequencies use irrational ratios (golden ratio, sqrt2, etc.)
+    // and are ~5x lower so cycles span the full terminal width.
+    let phi = 1.618033988;
+    let base = (x * 0.047 * phi + tf * 0.5 + phase).sin() * 0.2
+        + (x * 0.083 * std::f64::consts::SQRT_2 - tf * 0.35).sin() * 0.15
+        + (x * 0.131 + tf * 0.7).sin() * 0.12
+        + (x * 0.199 * phi - tf * 0.9).cos() * 0.08
+        + (x * 0.317 + tf * 1.2 + phase * 0.5).sin() * 0.06;
     let jitter = (eq_noise(xi.wrapping_mul(31).wrapping_add(ti)) - 0.5) * 0.3;
     let spike = if eq_noise(xi.wrapping_mul(17).wrapping_add(ti.wrapping_mul(7))) > 0.85 {
         (eq_noise(xi.wrapping_add(ti)) - 0.5) * 0.5
@@ -348,13 +355,15 @@ fn eq_wave_b(x: f64, tick: u16) -> f64 {
     let tf = tick as f64;
     let xi = x as u32;
     let ti = tick as u32;
+    let phase = eq_noise(xi.wrapping_mul(3011)) * std::f64::consts::TAU;
     let beat = ((tf * 0.37).sin() * 0.5 + 0.5)
         * ((tf * 1.1).cos() * 0.35 + 0.65);
-    let base = (x * 0.25 - tf * 0.4).cos() * 0.18
-        + (x * 0.6 + tf * 0.55).sin() * 0.16
-        + (x * 1.4 - tf * 0.8).sin() * 0.1
-        + (x * 2.7 + tf * 0.6).cos() * 0.09
-        + (x * 4.3 - tf * 1.0).sin() * 0.07;
+    let phi = 1.618033988;
+    let base = (x * 0.041 - tf * 0.4 + phase).cos() * 0.18
+        + (x * 0.071 * phi + tf * 0.55).sin() * 0.16
+        + (x * 0.113 * std::f64::consts::SQRT_2 - tf * 0.8).sin() * 0.1
+        + (x * 0.173 + tf * 0.6 + phase * 0.7).cos() * 0.09
+        + (x * 0.281 * phi - tf * 1.0).sin() * 0.07;
     let jitter = (eq_noise(xi.wrapping_mul(47).wrapping_add(ti.wrapping_mul(3))) - 0.5) * 0.25;
     let spike = if eq_noise(xi.wrapping_mul(23).wrapping_add(ti.wrapping_mul(11))) > 0.87 {
         (eq_noise(xi.wrapping_mul(7).wrapping_add(ti)) - 0.5) * 0.45
