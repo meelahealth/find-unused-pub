@@ -33,6 +33,7 @@ use rusqlite::Connection;
 /// Palette index: 0=latte, 1=frappe, 2=macchiato, 3=mocha.
 static PALETTE_IDX: AtomicU8 = AtomicU8::new(3);
 static ACTIVE_FILTER_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+static DISABLED_FILTER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 static IGNORED_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Get the active catppuccin flavor (resolved live from PALETTE_IDX).
@@ -55,6 +56,11 @@ fn cycle_palette() -> &'static str {
 /// Get the list of active filter names for TUI display.
 fn active_filter_names() -> &'static [&'static str] {
     ACTIVE_FILTER_NAMES.get().map_or(&[], |v| v.as_slice())
+}
+
+/// Get the list of disabled filter names for TUI display.
+fn disabled_filter_names() -> &'static [String] {
+    DISABLED_FILTER_NAMES.get().map_or(&[], |v| v.as_slice())
 }
 
 /// Get the list of ignored paths for TUI display.
@@ -125,7 +131,7 @@ impl Palette {
 )]
 struct Args {
     /// Catppuccin palette (latte, frappe, macchiato, mocha)
-    #[arg(long, value_enum, default_value = "mocha")]
+    #[arg(long, value_enum, default_value = "mocha", env = "FIND_UNUSED_PUB_PALETTE")]
     palette: Palette,
     /// Crate paths to scan (defaults to all crates/*)
     crate_paths: Vec<PathBuf>,
@@ -159,11 +165,11 @@ struct Args {
     nuke_whitelist: bool,
 
     /// Ignore crate paths (relative to workspace root, repeatable)
-    #[arg(long)]
+    #[arg(long, env = "FIND_UNUSED_PUB_IGNORE", value_delimiter = ',')]
     ignore: Vec<PathBuf>,
 
     /// Disable a filter plugin by name (repeatable, e.g. --disable-filter graphql)
-    #[arg(long)]
+    #[arg(long, env = "FIND_UNUSED_PUB_DISABLE_FILTER", value_delimiter = ',')]
     disable_filter: Vec<String>,
 }
 
@@ -2040,6 +2046,60 @@ fn finish_review(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Build status lines showing active config (filters, ignored paths, disabled filters).
+/// Shown at the top of scanning/summary views so the TUI is self-documenting.
+fn config_status_lines(dim: Style) -> Vec<Line<'static>> {
+    let mut lines = vec![];
+
+    let filters = active_filter_names();
+    let disabled = disabled_filter_names();
+    let ignored = ignored_paths();
+
+    // Only show config block if there's something non-default to report
+    let has_disabled = !disabled.is_empty();
+    let has_ignored = !ignored.is_empty();
+
+    if has_disabled || has_ignored {
+        let mut spans: Vec<Span> = vec![
+            Span::styled("  config ", Style::default().fg(ctp(flavor().subtext0)).add_modifier(Modifier::BOLD)),
+        ];
+
+        // Active filters
+        spans.push(Span::styled("filters: ", dim));
+        if filters.is_empty() {
+            spans.push(Span::styled("none", Style::default().fg(ctp(flavor().red))));
+        } else {
+            spans.push(Span::styled(
+                filters.join(", "),
+                Style::default().fg(ctp(flavor().green)),
+            ));
+        }
+
+        // Disabled filters (only show if any)
+        if has_disabled {
+            spans.push(Span::styled("  disabled: ", dim));
+            spans.push(Span::styled(
+                disabled.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                Style::default().fg(ctp(flavor().red)),
+            ));
+        }
+
+        // Ignored paths (only show if any)
+        if has_ignored {
+            spans.push(Span::styled("  ignoring: ", dim));
+            spans.push(Span::styled(
+                ignored.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                Style::default().fg(ctp(flavor().peach)),
+            ));
+        }
+
+        lines.push(Line::from(spans));
+        lines.push(Line::raw(""));
+    }
+
+    lines
+}
+
 fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
     let dim = Style::default().fg(ctp(flavor().overlay0));
     let scan = app.scan.as_ref().unwrap();
@@ -2055,24 +2115,16 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         .max()
         .unwrap_or(10);
 
-    let mut title = format!(
-        " 🔍 find-unused-pub — scanning ({}/{} crates, {:.1}s) [{}]",
+    let title = format!(
+        " 🔍 find-unused-pub — scanning ({}/{} crates, {:.1}s) [{}] ",
         done_count,
         total,
         elapsed.as_secs_f64(),
         palette_name(),
     );
-    let filters = active_filter_names();
-    if !filters.is_empty() {
-        title.push_str(&format!(" filters: {}", filters.join(",")));
-    }
-    let ignored = ignored_paths();
-    if !ignored.is_empty() {
-        title.push_str(&format!(" ignoring: {}", ignored.join(",")));
-    }
-    title.push(' ');
 
     let mut lines: Vec<Line> = vec![];
+    lines.extend(config_status_lines(dim));
 
     for (idx, name) in scan.crate_names.iter().enumerate() {
         let name_padded = format!("{:<width$}", name, width = max_name_len);
@@ -2158,22 +2210,13 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         SummaryView::Detail => "📋 detail",
         SummaryView::Skipped => "🛡️ skipped",
     };
-    let mut title = format!(
-        " 📦 find-unused-pub — {} crates in {:.1}s ({}) [{}]",
+    let title = format!(
+        " 📦 find-unused-pub — {} crates in {:.1}s ({}) [{}] ",
         app.results.len(),
         app.elapsed.as_secs_f64(),
         view_label,
         palette_name(),
     );
-    let filters = active_filter_names();
-    if !filters.is_empty() {
-        title.push_str(&format!(" filters: {}", filters.join(",")));
-    }
-    let ignored = ignored_paths();
-    if !ignored.is_empty() {
-        title.push_str(&format!(" ignoring: {}", ignored.join(",")));
-    }
-    title.push(' ');
 
     match app.summary_view {
         SummaryView::Table => draw_summary_table(frame, app, rows[0], &title, dim),
@@ -2232,6 +2275,7 @@ fn draw_summary_table(
         .unwrap_or(10);
 
     let mut table_lines: Vec<Line> = vec![];
+    table_lines.extend(config_status_lines(dim));
 
     for result in &app.results {
         let n_unused = result
@@ -2849,6 +2893,9 @@ async fn main() -> Result<()> {
     let filters = active_filters(&args.disable_filter);
     let filter_names: Vec<&'static str> = filters.iter().map(|f| f.name()).collect();
     ACTIVE_FILTER_NAMES.set(filter_names).expect("filter names already set");
+    DISABLED_FILTER_NAMES
+        .set(args.disable_filter.clone())
+        .expect("disabled filter names already set");
 
     // Store ignored paths for TUI display
     let ignore_display: Vec<String> = args.ignore.iter().map(|p| p.display().to_string()).collect();
