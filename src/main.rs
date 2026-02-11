@@ -270,10 +270,9 @@ fn theme() -> &'static ThemeColors {
     &themes[idx.min(themes.len() - 1)]
 }
 
-/// Multi-row braille waveform visualizer (oscilloscope style).
-/// Each cell row = 4 braille dot rows, so `height` cells = `height * 4` vertical levels.
+/// Multi-row dual-wave braille visualizer (oscilloscope style).
+/// Two waveforms rendered in contrasting colors; where they overlap the accent color is used.
 fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
-    // Braille dot bits per row within a cell.
     const DOT: [[u32; 2]; 4] = [
         [0x01, 0x08],
         [0x02, 0x10],
@@ -283,7 +282,7 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
 
     let t = theme();
     let tf = tick as f64;
-    let total_rows = (height as usize) * 4; // total vertical dot positions
+    let total_rows = (height as usize) * 4;
     let max_row = total_rows.saturating_sub(1);
 
     let noise = |seed: u32| -> f64 {
@@ -292,11 +291,12 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
         (h & 0xFFFF) as f64 / 65536.0
     };
 
-    let beat = ((tf * 0.52).sin() * 0.5 + 0.5)
+    let beat_a = ((tf * 0.52).sin() * 0.5 + 0.5)
         * ((tf * 1.3).sin() * 0.3 + 0.7);
+    let beat_b = ((tf * 0.37).sin() * 0.5 + 0.5)
+        * ((tf * 1.1).cos() * 0.35 + 0.65);
 
-    // Returns a dot-row index (0 = top, max_row = bottom)
-    let wave = |x: f64| -> usize {
+    let wave_a = |x: f64| -> usize {
         let xi = x as u32;
         let ti = tick as u32;
         let base = (x * 0.3 + tf * 0.5).sin() * 0.2
@@ -310,39 +310,72 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
         } else {
             0.0
         };
-        let v = (0.5 + (base + jitter + spike) * beat).clamp(0.0, 1.0);
+        let v = (0.5 + (base + jitter + spike) * beat_a).clamp(0.0, 1.0);
         (v * max_row as f64).round().clamp(0.0, max_row as f64) as usize
     };
 
-    // Pre-compute wave dot-row for each horizontal sample (2 per cell column).
-    let samples: Vec<usize> = (0..width)
+    // Second wave: different harmonics and phase offsets.
+    let wave_b = |x: f64| -> usize {
+        let xi = x as u32;
+        let ti = tick as u32;
+        let base = (x * 0.25 - tf * 0.4).cos() * 0.18
+            + (x * 0.6 + tf * 0.55).sin() * 0.16
+            + (x * 1.4 - tf * 0.8).sin() * 0.1
+            + (x * 2.7 + tf * 0.6).cos() * 0.09
+            + (x * 4.3 - tf * 1.0).sin() * 0.07;
+        let jitter = (noise(xi.wrapping_mul(47).wrapping_add(ti.wrapping_mul(3))) - 0.5) * 0.25;
+        let spike = if noise(xi.wrapping_mul(23).wrapping_add(ti.wrapping_mul(11))) > 0.87 {
+            (noise(xi.wrapping_mul(7).wrapping_add(ti)) - 0.5) * 0.45
+        } else {
+            0.0
+        };
+        let v = (0.5 + (base + jitter + spike) * beat_b).clamp(0.0, 1.0);
+        (v * max_row as f64).round().clamp(0.0, max_row as f64) as usize
+    };
+
+    // Pre-compute both waves (2 horizontal samples per cell column).
+    let samples_a: Vec<usize> = (0..width)
         .flat_map(|col| {
             let x = (col as f64) * 2.0;
-            [wave(x), wave(x + 1.0)]
+            [wave_a(x), wave_a(x + 1.0)]
+        })
+        .collect();
+    let samples_b: Vec<usize> = (0..width)
+        .flat_map(|col| {
+            let x = (col as f64) * 2.0;
+            [wave_b(x), wave_b(x + 1.0)]
         })
         .collect();
 
-    // Build one Line per cell row.
+    let color_a = t.tertiary;
+    let color_b = t.error;
+    let color_both = t.accent;
+
     let lines: Vec<Line<'a>> = (0..height as usize)
         .map(|cell_row| {
             let spans: Vec<Span<'a>> = (0..width as usize)
                 .map(|col| {
-                    let left_dot = samples[col * 2];
-                    let right_dot = samples[col * 2 + 1];
-                    let mut bits = 0x2800u32;
-                    // Check if the dot-row for left/right sample falls within this cell row.
+                    let mut bits_a = 0u32;
+                    let mut bits_b = 0u32;
                     let cell_top = cell_row * 4;
                     for dot_row in 0..4usize {
                         let global_row = cell_top + dot_row;
-                        if left_dot == global_row {
-                            bits |= DOT[dot_row][0];
-                        }
-                        if right_dot == global_row {
-                            bits |= DOT[dot_row][1];
-                        }
+                        if samples_a[col * 2] == global_row { bits_a |= DOT[dot_row][0]; }
+                        if samples_a[col * 2 + 1] == global_row { bits_a |= DOT[dot_row][1]; }
+                        if samples_b[col * 2] == global_row { bits_b |= DOT[dot_row][0]; }
+                        if samples_b[col * 2 + 1] == global_row { bits_b |= DOT[dot_row][1]; }
                     }
+                    let bits = 0x2800u32 | bits_a | bits_b;
+                    let has_a = bits_a != 0;
+                    let has_b = bits_b != 0;
+                    let fg = match (has_a, has_b) {
+                        (true, true) => color_both,
+                        (true, false) => color_a,
+                        (false, true) => color_b,
+                        (false, false) => color_a, // empty cell, doesn't matter
+                    };
                     let ch = char::from_u32(bits).unwrap_or(' ');
-                    Span::styled(String::from(ch), Style::default().fg(t.tertiary))
+                    Span::styled(String::from(ch), Style::default().fg(fg))
                 })
                 .collect();
             Line::from(spans)
