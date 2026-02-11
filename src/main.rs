@@ -263,9 +263,9 @@ struct Args {
     #[arg(long, env = "FIND_UNUSED_PUB_ENABLE_FILTER", value_delimiter = ',')]
     enable_filter: Vec<String>,
 
-    /// Resume from cached scan results instead of re-scanning
+    /// Ignore the scan cache and re-scan all crates from scratch
     #[arg(long)]
-    resume: bool,
+    no_cache: bool,
 }
 
 impl Args {
@@ -1802,6 +1802,8 @@ struct App {
     skipped_expanded: HashSet<String>,
     /// Cursor position in the skipped view (index among crates with skipped items).
     skipped_cursor: usize,
+    /// True if any results came from the scan cache.
+    from_cache: bool,
 }
 
 struct ReviewApp {
@@ -1872,6 +1874,7 @@ fn run_tui(
     workspace_root: &Path,
     conn: Connection,
     elapsed: Duration,
+    from_cache: bool,
 ) -> Result<()> {
     let (phase, all_unused) = if scan.is_some() {
         (TuiPhase::Scanning, vec![])
@@ -1896,6 +1899,7 @@ fn run_tui(
         detail_cursor: 0,
         skipped_expanded: HashSet::new(),
         skipped_cursor: 0,
+        from_cache,
     };
 
     // Enter alternate screen
@@ -2560,12 +2564,14 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         SummaryView::Detail => "📋 detail",
         SummaryView::Skipped => "🛡️ skipped",
     };
+    let cache_hint = if app.from_cache { " (cached — run with --no-cache to rescan)" } else { "" };
     let title = format!(
-        " 📦 find-unused-pub — {} crates in {:.1}s ({}) [{}] ",
+        " 📦 find-unused-pub — {} crates in {:.1}s ({}) [{}]{} ",
         app.results.len(),
         app.elapsed.as_secs_f64(),
         view_label,
         theme().name,
+        cache_hint,
     );
 
     match app.summary_view {
@@ -3338,7 +3344,7 @@ async fn main() -> Result<()> {
 
     // Wrap filters in Arc for sharing across spawn_blocking tasks
     let filters: std::sync::Arc<Vec<Box<dyn SymbolFilter>>> = std::sync::Arc::new(filters);
-    let use_cache = args.resume;
+    let use_cache = !args.no_cache;
 
     // Precompute content hashes for cache invalidation
     let crate_hashes: Vec<String> = target_crates
@@ -3471,11 +3477,13 @@ async fn main() -> Result<()> {
         .collect();
     let n_crates = crate_names.len();
     let (scan_tx, scan_rx) = mpsc::channel();
+    let mut any_cached = false;
     for (idx, crate_path) in target_crates.iter().enumerate() {
         let crate_name = crate_path.file_name().unwrap().to_str().unwrap().to_string();
-        // Check cache first when --resume is set
+        // Check cache first (default behavior, skip with --no-cache)
         if use_cache {
             if let Some(cached) = load_cached_result(&conn, &crate_name, &crate_hashes[idx]) {
+                any_cached = true;
                 let _ = scan_tx.send((idx, ScanMessage::Stage("cached".to_string())));
                 let _ = scan_tx.send((idx, ScanMessage::Done(cached)));
                 continue;
@@ -3508,7 +3516,7 @@ async fn main() -> Result<()> {
                         skipped: vec![],
                     }
                 });
-            // Save to cache for next --resume
+            // Save to cache for next run
             if let Ok(save_conn) = open_db(&db_path) {
                 save_cached_result(&save_conn, &result.crate_name, &hash, &result);
             }
@@ -3524,7 +3532,7 @@ async fn main() -> Result<()> {
         rx: scan_rx,
         start,
     };
-    run_tui(vec![], Some(scan_state), &workspace_root, conn, Duration::ZERO)?;
+    run_tui(vec![], Some(scan_state), &workspace_root, conn, Duration::ZERO, any_cached)?;
 
     Ok(())
 }
