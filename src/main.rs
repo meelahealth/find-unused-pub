@@ -39,7 +39,7 @@ static DISABLED_FILTER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 static ENABLED_FILTER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 static IGNORED_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 
-const PALETTE_COUNT: u8 = 5;
+const PALETTE_COUNT: u8 = 8;
 
 #[derive(Debug)]
 struct ThemeColors {
@@ -138,6 +138,117 @@ fn eldritch_theme() -> ThemeColors {
     }
 }
 
+fn ayu_dark_theme() -> ThemeColors {
+    let bg       = Color::Rgb(0x0D, 0x10, 0x17);
+    let fg       = Color::Rgb(0xBF, 0xBD, 0xB6);
+    let ui_fg    = Color::Rgb(0x5A, 0x63, 0x78);
+    let line     = Color::Rgb(0x1B, 0x1F, 0x29);
+    let accent   = Color::Rgb(0xE6, 0xB4, 0x50);
+    let orange   = Color::Rgb(0xFF, 0x8F, 0x40);
+    let yellow   = Color::Rgb(0xFF, 0xB4, 0x54);
+    let green    = Color::Rgb(0xAA, 0xD9, 0x4C);
+    let blue     = Color::Rgb(0x59, 0xC2, 0xFF);
+    let indigo   = Color::Rgb(0x39, 0xBA, 0xE6);
+    let purple   = Color::Rgb(0xD2, 0xA6, 0xFF);
+    let red      = Color::Rgb(0xF0, 0x71, 0x78);
+    let teal     = Color::Rgb(0x95, 0xE6, 0xCB);
+    let error    = Color::Rgb(0xD9, 0x57, 0x57);
+
+    ThemeColors {
+        name: "ayu-dark",
+        surface: bg,
+        on_surface: fg,
+        on_surface_variant: ui_fg,
+        dim: Color::Rgb(0x47, 0x4A, 0x56),
+        dim_accent: Color::Rgb(0x5A, 0x5E, 0x6B),
+        outline: line,
+        primary: blue,
+        secondary: indigo,
+        tertiary: orange,
+        accent,
+        info: indigo,
+        error,
+        warning: yellow,
+        success: green,
+        filter_colors: [teal, purple, orange, indigo],
+        swatch: vec![red, orange, yellow, green, teal, indigo, blue, purple, accent],
+    }
+}
+
+fn ayu_mirage_theme() -> ThemeColors {
+    let bg       = Color::Rgb(0x1F, 0x24, 0x30);
+    let fg       = Color::Rgb(0xCC, 0xCA, 0xC2);
+    let ui_fg    = Color::Rgb(0x70, 0x7A, 0x8C);
+    let line     = Color::Rgb(0x17, 0x1B, 0x24);
+    let accent   = Color::Rgb(0xFF, 0xCC, 0x66);
+    let orange   = Color::Rgb(0xFF, 0xA6, 0x59);
+    let yellow   = Color::Rgb(0xFF, 0xCD, 0x66);
+    let green    = Color::Rgb(0xD5, 0xFF, 0x80);
+    let blue     = Color::Rgb(0x73, 0xD0, 0xFF);
+    let indigo   = Color::Rgb(0x5C, 0xCF, 0xE6);
+    let purple   = Color::Rgb(0xDF, 0xBF, 0xFF);
+    let red      = Color::Rgb(0xF2, 0x87, 0x79);
+    let teal     = Color::Rgb(0x95, 0xE6, 0xCB);
+    let error    = Color::Rgb(0xFF, 0x66, 0x66);
+
+    ThemeColors {
+        name: "ayu-mirage",
+        surface: bg,
+        on_surface: fg,
+        on_surface_variant: ui_fg,
+        dim: Color::Rgb(0x50, 0x56, 0x66),
+        dim_accent: Color::Rgb(0x60, 0x66, 0x76),
+        outline: line,
+        primary: blue,
+        secondary: indigo,
+        tertiary: orange,
+        accent,
+        info: indigo,
+        error,
+        warning: yellow,
+        success: green,
+        filter_colors: [teal, purple, orange, indigo],
+        swatch: vec![red, orange, yellow, green, teal, indigo, blue, purple, accent],
+    }
+}
+
+fn ayu_light_theme() -> ThemeColors {
+    let bg       = Color::Rgb(0xF8, 0xF9, 0xFA);
+    let fg       = Color::Rgb(0x5C, 0x61, 0x66);
+    let ui_fg    = Color::Rgb(0x82, 0x8E, 0x9F);
+    let line     = Color::Rgb(0xEB, 0xEE, 0xF0);
+    let accent   = Color::Rgb(0xF2, 0x97, 0x18);
+    let orange   = Color::Rgb(0xFA, 0x85, 0x32);
+    let yellow   = Color::Rgb(0xEB, 0xA4, 0x00);
+    let green    = Color::Rgb(0x86, 0xB3, 0x00);
+    let blue     = Color::Rgb(0x22, 0xA4, 0xE6);
+    let indigo   = Color::Rgb(0x55, 0xB4, 0xD4);
+    let purple   = Color::Rgb(0xA3, 0x7A, 0xCC);
+    let red      = Color::Rgb(0xF0, 0x71, 0x71);
+    let teal     = Color::Rgb(0x4C, 0xBF, 0x99);
+    let error    = Color::Rgb(0xE6, 0x50, 0x50);
+
+    ThemeColors {
+        name: "ayu-light",
+        surface: bg,
+        on_surface: fg,
+        on_surface_variant: ui_fg,
+        dim: Color::Rgb(0xAB, 0xB0, 0xB6),
+        dim_accent: Color::Rgb(0x9A, 0x9E, 0xA6),
+        outline: line,
+        primary: blue,
+        secondary: indigo,
+        tertiary: orange,
+        accent,
+        info: indigo,
+        error,
+        warning: yellow,
+        success: green,
+        filter_colors: [teal, purple, orange, indigo],
+        swatch: vec![red, orange, yellow, green, teal, indigo, blue, purple, accent],
+    }
+}
+
 fn build_all_themes() -> Vec<ThemeColors> {
     let p = &catppuccin::PALETTE;
     vec![
@@ -146,6 +257,9 @@ fn build_all_themes() -> Vec<ThemeColors> {
         theme_from_catppuccin("macchiato", &p.macchiato.colors),
         theme_from_catppuccin("mocha", &p.mocha.colors),
         eldritch_theme(),
+        ayu_dark_theme(),
+        ayu_mirage_theme(),
+        ayu_light_theme(),
     ]
 }
 
@@ -208,6 +322,12 @@ enum Palette {
     Macchiato,
     Mocha,
     Eldritch,
+    #[value(name = "ayu-dark")]
+    AyuDark,
+    #[value(name = "ayu-mirage")]
+    AyuMirage,
+    #[value(name = "ayu-light")]
+    AyuLight,
 }
 
 impl Palette {
@@ -218,6 +338,9 @@ impl Palette {
             Palette::Macchiato => 2,
             Palette::Mocha => 3,
             Palette::Eldritch => 4,
+            Palette::AyuDark => 5,
+            Palette::AyuMirage => 6,
+            Palette::AyuLight => 7,
         }
     }
 }

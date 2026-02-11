@@ -1,6 +1,6 @@
 # find-unused-pub
 
-Find `pub` items in a Rust workspace that are either unused entirely or only used within their own crate. Ships with a full TUI (ratatui) for browsing results, reviewing items interactively, and applying fixes. Includes catppuccin and [eldritch](https://github.com/eldritch-theme/eldritch) color themes.
+Find `pub` items in a Rust workspace that are either unused entirely or only used within their own crate. Ships with a full TUI (ratatui) for browsing results, reviewing items interactively, and applying fixes. Includes catppuccin, [eldritch](https://github.com/eldritch-theme/eldritch), and [ayu](https://github.com/ayu-theme/ayu-colors) color themes.
 
 ## Install
 
@@ -37,6 +37,7 @@ find-unused-pub --enable-filter cynic
 # Use a different palette
 find-unused-pub --palette latte
 find-unused-pub --palette eldritch
+find-unused-pub --palette ayu-dark
 
 # Auto-fix crate-internal items → pub(crate)
 find-unused-pub --fix crates/auth
@@ -55,7 +56,7 @@ find-unused-pub --nuke-allowlist
 
 | Flag | Description |
 |------|-------------|
-| `--palette <name>` | Color theme: `latte`, `frappe`, `macchiato`, `mocha` (default), `eldritch` |
+| `--palette <name>` | Color theme: `latte`, `frappe`, `macchiato`, `mocha` (default), `eldritch`, `ayu-dark`, `ayu-mirage`, `ayu-light` |
 | `--ignore <path>` | Skip a crate path (repeatable, relative to workspace root) |
 | `--disable-filter <name>` | Turn off a filter plugin (repeatable, see [Filters](#filters)) |
 | `--enable-filter <name>` | Turn on an opt-in filter plugin (repeatable, see [Filters](#filters)) |
