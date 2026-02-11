@@ -155,18 +155,6 @@ struct Args {
     #[arg(long)]
     fix: bool,
 
-    /// Interactively review unused items (fix / allowlist / skip)
-    #[arg(long)]
-    review_unused: bool,
-
-    /// Interactively review crate-internal items (fix / allowlist / skip)
-    #[arg(long)]
-    review_crate_internal: bool,
-
-    /// Alias for --review-unused
-    #[arg(long)]
-    review: bool,
-
     /// Clear the whitelist database
     #[arg(long)]
     nuke_whitelist: bool,
@@ -187,10 +175,6 @@ struct Args {
 impl Args {
     fn should_fix_crate_internal(&self) -> bool {
         self.fix_crate_internal || self.fix
-    }
-
-    fn should_review_unused(&self) -> bool {
-        self.review_unused || self.review
     }
 }
 
@@ -3159,8 +3143,6 @@ async fn main() -> Result<()> {
         for handle in handles {
             results.push(handle.await??);
         }
-        let elapsed = start.elapsed();
-
         let all_unused: Vec<UnusedSymbol> = results
             .iter()
             .flat_map(|r| r.unused.clone())
@@ -3194,12 +3176,6 @@ async fn main() -> Result<()> {
         if fixed > 0 {
             eprintln!("{}", format!("Fixed {fixed} items").bold().green());
         }
-        // Don't launch TUI if only batch-fixing
-        if !args.should_review_unused() && !args.review_crate_internal {
-            return Ok(());
-        }
-        // Launch TUI with pre-scanned results
-        run_tui(results, None, &workspace_root, conn, elapsed)?;
         return Ok(());
     }
 

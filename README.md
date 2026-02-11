@@ -43,9 +43,6 @@ find-unused-pub --fix crates/auth
 # Auto-fix unused items (deletes the entire item)
 find-unused-pub --fix-unused
 
-# Interactively review unused items (fix / whitelist / skip)
-find-unused-pub --review
-
 # Clear the whitelist database
 find-unused-pub --nuke-whitelist
 ```
@@ -61,9 +58,6 @@ find-unused-pub --nuke-whitelist
 | `--fix` | Alias for `--fix-crate-internal` |
 | `--fix-crate-internal` | Auto-fix crate-internal items to `pub(crate)` |
 | `--fix-unused` | Auto-fix unused items by deleting them entirely |
-| `--review` | Alias for `--review-unused` |
-| `--review-unused` | Interactively review unused items |
-| `--review-crate-internal` | Interactively review crate-internal items |
 | `--nuke-whitelist` | Clear the SQLite whitelist database |
 
 Flags compose: `--fix --fix-unused` fixes both categories.
