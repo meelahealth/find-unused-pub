@@ -262,6 +262,10 @@ struct Args {
     /// Enable an opt-in filter plugin by name (repeatable, e.g. --enable-filter cynic)
     #[arg(long, env = "FIND_UNUSED_PUB_ENABLE_FILTER", value_delimiter = ',')]
     enable_filter: Vec<String>,
+
+    /// Resume from cached scan results instead of re-scanning
+    #[arg(long)]
+    resume: bool,
 }
 
 impl Args {
@@ -274,20 +278,20 @@ impl Args {
 // Data types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PubSymbol {
     name: String,
     file: PathBuf,
     line: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum SymbolKind {
     UnusedAnywhere,
     CrateInternalOnly { refs: usize },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct UnusedSymbol {
     symbol: PubSymbol,
     kind: SymbolKind,
@@ -296,10 +300,10 @@ struct UnusedSymbol {
     internal_refs: Vec<(PathBuf, usize)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum SkipReason {
-    Graphql(&'static str),
-    Cynic(&'static str),
+    Graphql(String),
+    Cynic(String),
     Orm,
 }
 
@@ -483,6 +487,7 @@ fn all_filter_names() -> Vec<&'static str> {
     vec!["orm", "graphql", "builder", "cynic"]
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CrateResult {
     crate_name: String,
     items_found: usize,
@@ -1172,6 +1177,12 @@ fn open_db(workspace_root: &Path) -> Result<Connection> {
             reason TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (symbol, crate_name)
+        );
+        CREATE TABLE IF NOT EXISTS scan_cache (
+            crate_name TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            results_json TEXT NOT NULL,
+            scanned_at TEXT DEFAULT CURRENT_TIMESTAMP
         );",
     )?;
     Ok(conn)
@@ -1216,6 +1227,88 @@ fn nuke_allowlist(conn: &Connection) -> Result<()> {
         );",
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Scan cache
+// ---------------------------------------------------------------------------
+
+/// Compute a content hash for a crate's src/ directory.
+/// Uses file paths + modification times as a cheap fingerprint.
+fn crate_content_hash(crate_path: &Path) -> String {
+    use std::fmt::Write;
+    let src_dir = crate_path.join("src");
+    let mut entries: Vec<(String, u64)> = vec![];
+    if let Ok(walker) = fs::read_dir(&src_dir) {
+        collect_rs_mtimes(&src_dir, &mut entries);
+        let _ = walker; // consumed above
+    }
+    entries.sort();
+    let mut hasher = String::new();
+    for (path, mtime) in &entries {
+        let _ = write!(hasher, "{path}:{mtime};");
+    }
+    format!("{:x}", simple_hash(hasher.as_bytes()))
+}
+
+/// Recursively collect .rs files and their modification times.
+fn collect_rs_mtimes(dir: &Path, out: &mut Vec<(String, u64)>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_mtimes(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            out.push((path.to_string_lossy().to_string(), mtime));
+        }
+    }
+}
+
+/// Simple non-cryptographic hash (FNV-1a).
+fn simple_hash(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Try to load a cached scan result for a crate.
+fn load_cached_result(conn: &Connection, crate_name: &str, expected_hash: &str) -> Option<CrateResult> {
+    let mut stmt = conn
+        .prepare("SELECT content_hash, results_json FROM scan_cache WHERE crate_name = ?1")
+        .ok()?;
+    let (hash, json): (String, String) = stmt
+        .query_row(rusqlite::params![crate_name], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .ok()?;
+    if hash != expected_hash {
+        return None;
+    }
+    serde_json::from_str(&json).ok()
+}
+
+/// Save a scan result to the cache.
+fn save_cached_result(conn: &Connection, crate_name: &str, content_hash: &str, result: &CrateResult) {
+    let json = match serde_json::to_string(result) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO scan_cache (crate_name, content_hash, results_json) VALUES (?1, ?2, ?3)",
+        rusqlite::params![crate_name, content_hash, json],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,7 +1430,7 @@ fn find_item_at_line<'a>(
 
 /// Check if a pub symbol at `line` (0-indexed) is exempt from unused detection
 /// because it has async-graphql attributes (directly or via parent impl block).
-fn is_graphql_exempt(source: &str, line: usize) -> Option<&'static str> {
+fn is_graphql_exempt(source: &str, line: usize) -> Option<String> {
     let mut parser = tree_sitter::Parser::new();
     if parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -1374,7 +1467,7 @@ fn is_graphql_exempt(source: &str, line: usize) -> Option<&'static str> {
 }
 
 /// Check if a node's preceding sibling attributes contain any GRAPHQL_ATTRS.
-fn node_has_graphql_attr(node: tree_sitter::Node, source: &str) -> Option<&'static str> {
+fn node_has_graphql_attr(node: tree_sitter::Node, source: &str) -> Option<String> {
     let mut sibling = node.prev_sibling();
     while let Some(s) = sibling {
         match s.kind() {
@@ -1382,7 +1475,7 @@ fn node_has_graphql_attr(node: tree_sitter::Node, source: &str) -> Option<&'stat
                 let text = &source[s.start_byte()..s.end_byte()];
                 for attr in GRAPHQL_ATTRS {
                     if text.contains(attr) {
-                        return Some(attr);
+                        return Some(attr.to_string());
                     }
                 }
             }
@@ -1431,7 +1524,7 @@ const CYNIC_ATTRS: &[&str] = &[
 ];
 
 /// Check if a symbol at `line` (0-indexed) has a cynic derive attribute.
-fn is_cynic_exempt(source: &str, line: usize) -> Option<&'static str> {
+fn is_cynic_exempt(source: &str, line: usize) -> Option<String> {
     let mut parser = tree_sitter::Parser::new();
     if parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -1454,7 +1547,7 @@ fn is_cynic_exempt(source: &str, line: usize) -> Option<&'static str> {
 }
 
 /// Check if a node's preceding sibling attributes contain any CYNIC_ATTRS.
-fn node_has_cynic_attr(node: tree_sitter::Node, source: &str) -> Option<&'static str> {
+fn node_has_cynic_attr(node: tree_sitter::Node, source: &str) -> Option<String> {
     let mut sibling = node.prev_sibling();
     while let Some(s) = sibling {
         match s.kind() {
@@ -1463,7 +1556,7 @@ fn node_has_cynic_attr(node: tree_sitter::Node, source: &str) -> Option<&'static
                 if text.contains("cynic") {
                     for attr in CYNIC_ATTRS {
                         if text.contains(attr) {
-                            return Some(attr);
+                            return Some(attr.to_string());
                         }
                     }
                 }
@@ -3243,22 +3336,34 @@ async fn main() -> Result<()> {
 
     // Wrap filters in Arc for sharing across spawn_blocking tasks
     let filters: std::sync::Arc<Vec<Box<dyn SymbolFilter>>> = std::sync::Arc::new(filters);
+    let use_cache = args.resume;
+
+    // Precompute content hashes for cache invalidation
+    let crate_hashes: Vec<String> = target_crates
+        .iter()
+        .map(|p| crate_content_hash(p))
+        .collect();
 
     // Non-interactive batch fix: must await all results first
     if args.should_fix_crate_internal() || args.fix_unused {
-        let mut handles = vec![];
-        for crate_path in &target_crates {
-            let crate_path = crate_path.clone();
-            let all_dirs = all_crate_dirs.clone();
+        let mut results = vec![];
+        for (i, crate_path) in target_crates.iter().enumerate() {
+            let crate_name = crate_path.file_name().unwrap().to_str().unwrap();
+            if use_cache {
+                if let Some(cached) = load_cached_result(&conn, crate_name, &crate_hashes[i]) {
+                    results.push(cached);
+                    continue;
+                }
+            }
+            let cp = crate_path.clone();
+            let ad = all_crate_dirs.clone();
             let wl = allowlist.clone();
             let f = filters.clone();
-            handles.push(tokio::task::spawn_blocking(move || {
-                analyze_crate(&crate_path, &all_dirs, &wl, &f, &|_| {})
-            }));
-        }
-        let mut results = vec![];
-        for handle in handles {
-            results.push(handle.await??);
+            let result = tokio::task::spawn_blocking(move || {
+                analyze_crate(&cp, &ad, &wl, &f, &|_| {})
+            }).await??;
+            save_cached_result(&conn, crate_name, &crate_hashes[i], &result);
+            results.push(result);
         }
         let all_unused: Vec<UnusedSymbol> = results
             .iter()
@@ -3298,19 +3403,24 @@ async fn main() -> Result<()> {
 
     // Non-interactive pipe output: when stdout is not a TTY, print plain text
     if !std::io::stdout().is_terminal() {
-        let mut handles = vec![];
-        for crate_path in &target_crates {
-            let crate_path = crate_path.clone();
-            let all_dirs = all_crate_dirs.clone();
+        let mut results = vec![];
+        for (i, crate_path) in target_crates.iter().enumerate() {
+            let crate_name = crate_path.file_name().unwrap().to_str().unwrap();
+            if use_cache {
+                if let Some(cached) = load_cached_result(&conn, crate_name, &crate_hashes[i]) {
+                    results.push(cached);
+                    continue;
+                }
+            }
+            let cp = crate_path.clone();
+            let ad = all_crate_dirs.clone();
             let wl = allowlist.clone();
             let f = filters.clone();
-            handles.push(tokio::task::spawn_blocking(move || {
-                analyze_crate(&crate_path, &all_dirs, &wl, &f, &|_| {})
-            }));
-        }
-        let mut results = vec![];
-        for handle in handles {
-            results.push(handle.await??);
+            let result = tokio::task::spawn_blocking(move || {
+                analyze_crate(&cp, &ad, &wl, &f, &|_| {})
+            }).await??;
+            save_cached_result(&conn, crate_name, &crate_hashes[i], &result);
+            results.push(result);
         }
         let elapsed = start.elapsed();
 
@@ -3360,11 +3470,22 @@ async fn main() -> Result<()> {
     let n_crates = crate_names.len();
     let (scan_tx, scan_rx) = mpsc::channel();
     for (idx, crate_path) in target_crates.iter().enumerate() {
+        let crate_name = crate_path.file_name().unwrap().to_str().unwrap().to_string();
+        // Check cache first when --resume is set
+        if use_cache {
+            if let Some(cached) = load_cached_result(&conn, &crate_name, &crate_hashes[idx]) {
+                let _ = scan_tx.send((idx, ScanMessage::Stage("cached".to_string())));
+                let _ = scan_tx.send((idx, ScanMessage::Done(cached)));
+                continue;
+            }
+        }
         let crate_path = crate_path.clone();
         let all_dirs = all_crate_dirs.clone();
         let wl = allowlist.clone();
         let tx = scan_tx.clone();
         let f = filters.clone();
+        let hash = crate_hashes[idx].clone();
+        let db_path = workspace_root.clone();
         tokio::task::spawn_blocking(move || {
             let progress_tx = tx.clone();
             let progress_idx = idx;
@@ -3385,6 +3506,10 @@ async fn main() -> Result<()> {
                         skipped: vec![],
                     }
                 });
+            // Save to cache for next --resume
+            if let Ok(save_conn) = open_db(&db_path) {
+                save_cached_result(&save_conn, &result.crate_name, &hash, &result);
+            }
             let _ = tx.send((idx, ScanMessage::Done(result)));
         });
     }
@@ -3775,7 +3900,7 @@ impl MyQuery {
 }
 ";
         // pub async fn resolver is on line 2 (0-indexed)
-        assert_eq!(is_graphql_exempt(source, 2), Some("Object"));
+        assert_eq!(is_graphql_exempt(source, 2), Some("Object".to_string()));
     }
 
     #[test]
@@ -3787,7 +3912,7 @@ pub struct Output {
 }
 ";
         // pub struct Output is on line 1 (0-indexed)
-        assert_eq!(is_graphql_exempt(source, 1), Some("SimpleObject"));
+        assert_eq!(is_graphql_exempt(source, 1), Some("SimpleObject".to_string()));
     }
 
     #[test]
@@ -3811,7 +3936,7 @@ impl MyMutation {
     }
 }
 ";
-        assert_eq!(is_graphql_exempt(source, 2), Some("Mutation"));
+        assert_eq!(is_graphql_exempt(source, 2), Some("Mutation".to_string()));
     }
 
     #[test]
@@ -3836,7 +3961,7 @@ impl MyMutation {
         let kept_names: Vec<&str> = kept.iter().map(|s| s.name.as_str()).collect();
         assert!(kept_names.contains(&"regular_fn"));
         assert!(!kept_names.contains(&"GqlOutput"));
-        assert!(skipped.iter().any(|(sym, reason)| sym.name == "GqlOutput" && *reason == SkipReason::Graphql("SimpleObject")));
+        assert!(skipped.iter().any(|(sym, reason)| sym.name == "GqlOutput" && *reason == SkipReason::Graphql("SimpleObject".to_string())));
     }
 
     // -- derive_builder aliases ----------------------------------------------
@@ -4092,5 +4217,60 @@ pub struct Plain {
             result.unused.iter().all(|u| u.symbol.name != "bar"),
             "bar has a real call site and should not be unused"
         );
+    }
+
+    // -- insta snapshot: scan results ----------------------------------------
+
+    #[test]
+    fn snapshot_scan_results() {
+        let ws = create_workspace(&[
+            (
+                "alpha",
+                &[(
+                    "lib.rs",
+                    concat!(
+                        "pub fn used_externally() {}\n",
+                        "pub fn used_internally() { used_internally_helper(); }\n",
+                        "fn used_internally_helper() { used_internally(); }\n",
+                        "pub fn dead_code() {}\n",
+                    ),
+                )],
+            ),
+            (
+                "beta",
+                &[("lib.rs", "fn consumer() { used_externally(); }\n")],
+            ),
+        ]);
+        let crate_path = ws.path().join("crates/alpha");
+        let src_dirs = crate_dirs(&ws);
+        let allowlist = HashSet::new();
+        let result =
+            analyze_crate(&crate_path, &src_dirs, &allowlist, &all_filters(), &|_| {}).unwrap();
+
+        // Redact the temp dir paths so snapshots are stable
+        let json = serde_json::to_value(&result).unwrap();
+        let stable = redact_paths(json, ws.path());
+        insta::assert_json_snapshot!("scan_results", stable);
+    }
+
+    /// Replace absolute temp-dir paths with `<WORKSPACE>` so snapshots are deterministic.
+    fn redact_paths(value: serde_json::Value, ws_root: &Path) -> serde_json::Value {
+        let prefix = ws_root.to_string_lossy();
+        match value {
+            serde_json::Value::String(s) => {
+                serde_json::Value::String(s.replace(prefix.as_ref(), "<WORKSPACE>"))
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.into_iter().map(|v| redact_paths(v, ws_root)).collect())
+            }
+            serde_json::Value::Object(map) => {
+                serde_json::Value::Object(
+                    map.into_iter()
+                        .map(|(k, v)| (k, redact_paths(v, ws_root)))
+                        .collect(),
+                )
+            }
+            other => other,
+        }
     }
 }

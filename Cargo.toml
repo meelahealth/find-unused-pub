@@ -17,6 +17,8 @@ grep-searcher = "0.1"
 grep-matcher = "0.1"
 ignore = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 crossterm = "0.28"
 owo-colors = "4"
 ratatui = "0.29"
@@ -26,4 +28,5 @@ tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 
 [dev-dependencies]
+insta = { version = "1", features = ["json"] }
 tempfile = "3"

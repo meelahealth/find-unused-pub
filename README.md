@@ -44,6 +44,9 @@ find-unused-pub --fix crates/auth
 # Auto-fix unused items (deletes the entire item)
 find-unused-pub --fix-unused
 
+# Resume from cached scan results (skips unchanged crates)
+find-unused-pub --resume
+
 # Clear the allowlist database
 find-unused-pub --nuke-allowlist
 ```
@@ -56,6 +59,7 @@ find-unused-pub --nuke-allowlist
 | `--ignore <path>` | Skip a crate path (repeatable, relative to workspace root) |
 | `--disable-filter <name>` | Turn off a filter plugin (repeatable, see [Filters](#filters)) |
 | `--enable-filter <name>` | Turn on an opt-in filter plugin (repeatable, see [Filters](#filters)) |
+| `--resume` | Reuse cached scan results for unchanged crates |
 | `--fix` | Alias for `--fix-crate-internal` |
 | `--fix-crate-internal` | Auto-fix crate-internal items to `pub(crate)` |
 | `--fix-unused` | Auto-fix unused items by deleting them entirely |

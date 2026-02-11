@@ -1,0 +1,40 @@
+---
+source: src/main.rs
+expression: stable
+---
+{
+  "crate_name": "alpha",
+  "items_found": 3,
+  "skipped": [],
+  "unused": [
+    {
+      "crate_name": "alpha",
+      "internal_refs": [
+        [
+          "<WORKSPACE>/crates/alpha/src/lib.rs",
+          3
+        ]
+      ],
+      "kind": {
+        "CrateInternalOnly": {
+          "refs": 2
+        }
+      },
+      "symbol": {
+        "file": "<WORKSPACE>/crates/alpha/src/lib.rs",
+        "line": 2,
+        "name": "used_internally"
+      }
+    },
+    {
+      "crate_name": "alpha",
+      "internal_refs": [],
+      "kind": "UnusedAnywhere",
+      "symbol": {
+        "file": "<WORKSPACE>/crates/alpha/src/lib.rs",
+        "line": 4,
+        "name": "dead_code"
+      }
+    }
+  ]
+}
