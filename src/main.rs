@@ -28,49 +28,153 @@ use ratatui::Terminal;
 use rusqlite::Connection;
 
 // ---------------------------------------------------------------------------
-// Catppuccin theme
+// Theme — semantic color layer
 // ---------------------------------------------------------------------------
 
-/// Palette index: 0=latte, 1=frappe, 2=macchiato, 3=mocha.
+/// Palette index: cycles through all available themes.
 static PALETTE_IDX: AtomicU8 = AtomicU8::new(3);
+static THEMES: OnceLock<Vec<ThemeColors>> = OnceLock::new();
 static ACTIVE_FILTER_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
 static DISABLED_FILTER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 static ENABLED_FILTER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 static IGNORED_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 
-/// Get the active catppuccin flavor (resolved live from PALETTE_IDX).
-fn flavor() -> &'static catppuccin::FlavorColors {
-    Palette::from_index(PALETTE_IDX.load(Ordering::Relaxed)).flavor_colors()
+const PALETTE_COUNT: u8 = 5;
+
+#[derive(Debug)]
+struct ThemeColors {
+    name: &'static str,
+
+    // Surfaces
+    surface: Color,
+    // Text hierarchy
+    on_surface: Color,
+    on_surface_variant: Color,
+    dim: Color,
+    dim_accent: Color,
+    // Borders
+    outline: Color,
+    // Semantic accents
+    primary: Color,
+    secondary: Color,
+    tertiary: Color,
+    accent: Color,
+    info: Color,
+    // Status
+    error: Color,
+    warning: Color,
+    success: Color,
+    // Filter label colors (orm, graphql, builder, cynic)
+    filter_colors: [Color; 4],
+    // Swatch for palette preview
+    swatch: Vec<Color>,
 }
 
-/// Get the active palette name for display.
-fn palette_name() -> &'static str {
-    Palette::from_index(PALETTE_IDX.load(Ordering::Relaxed)).name()
+/// Convert a catppuccin color to ratatui Color.
+fn ctp(c: catppuccin::Color) -> Color {
+    c.into()
 }
 
-/// Build a palette swatch line: colored █ blocks for each accent color + name.
+fn theme_from_catppuccin(name: &'static str, f: &catppuccin::FlavorColors) -> ThemeColors {
+    ThemeColors {
+        name,
+        surface: ctp(f.base),
+        on_surface: ctp(f.text),
+        on_surface_variant: ctp(f.subtext0),
+        dim: ctp(f.overlay0),
+        dim_accent: ctp(f.overlay1),
+        outline: ctp(f.surface2),
+        primary: ctp(f.lavender),
+        secondary: ctp(f.sapphire),
+        tertiary: ctp(f.peach),
+        accent: ctp(f.mauve),
+        info: ctp(f.sky),
+        error: ctp(f.red),
+        warning: ctp(f.yellow),
+        success: ctp(f.green),
+        filter_colors: [ctp(f.teal), ctp(f.mauve), ctp(f.peach), ctp(f.sky)],
+        swatch: vec![
+            ctp(f.rosewater), ctp(f.flamingo), ctp(f.pink), ctp(f.mauve),
+            ctp(f.red), ctp(f.maroon), ctp(f.peach), ctp(f.yellow),
+            ctp(f.green), ctp(f.teal), ctp(f.sky), ctp(f.sapphire),
+            ctp(f.blue), ctp(f.lavender),
+        ],
+    }
+}
+
+fn eldritch_theme() -> ThemeColors {
+    let bg       = Color::Rgb(0x21, 0x23, 0x37); // Sunken Depths Grey
+    let cur_line = Color::Rgb(0x32, 0x34, 0x49); // Shallow Depths Grey
+    let fg       = Color::Rgb(0xeb, 0xfa, 0xfa); // Lighthouse White
+    let comment  = Color::Rgb(0x70, 0x81, 0xd0); // The Old One Purple
+    let cyan     = Color::Rgb(0x04, 0xd1, 0xf9); // Watery Tomb Blue
+    let green    = Color::Rgb(0x37, 0xf4, 0x99); // Great Old One Green
+    let orange   = Color::Rgb(0xf7, 0xc6, 0x7f); // Dreaming Orange
+    let pink     = Color::Rgb(0xf2, 0x65, 0xb5); // Pustule Pink
+    let purple   = Color::Rgb(0xa4, 0x8c, 0xf2); // Lovecraft Purple
+    let red      = Color::Rgb(0xf1, 0x6c, 0x75); // R'lyeh Red
+    let yellow   = Color::Rgb(0xf1, 0xfc, 0x79); // Gold of Yuggoth
+    // Derived dim variants (blend comment toward bg)
+    let dim_acc  = Color::Rgb(0x58, 0x5a, 0x80);
+
+    ThemeColors {
+        name: "eldritch",
+        surface: bg,
+        on_surface: fg,
+        on_surface_variant: comment,
+        dim: Color::Rgb(0x50, 0x52, 0x70),
+        dim_accent: dim_acc,
+        outline: cur_line,
+        primary: purple,
+        secondary: cyan,
+        tertiary: orange,
+        accent: pink,
+        info: cyan,
+        error: red,
+        warning: yellow,
+        success: green,
+        filter_colors: [green, purple, orange, cyan],
+        swatch: vec![fg, comment, cyan, green, orange, pink, purple, red, yellow, cur_line, dim_acc],
+    }
+}
+
+fn build_all_themes() -> Vec<ThemeColors> {
+    let p = &catppuccin::PALETTE;
+    vec![
+        theme_from_catppuccin("latte", &p.latte.colors),
+        theme_from_catppuccin("frappe", &p.frappe.colors),
+        theme_from_catppuccin("macchiato", &p.macchiato.colors),
+        theme_from_catppuccin("mocha", &p.mocha.colors),
+        eldritch_theme(),
+    ]
+}
+
+/// Get the active theme (resolved live from PALETTE_IDX).
+fn theme() -> &'static ThemeColors {
+    let themes = THEMES.get().expect("themes not initialized");
+    let idx = PALETTE_IDX.load(Ordering::Relaxed) as usize;
+    &themes[idx.min(themes.len() - 1)]
+}
+
+/// Build a palette swatch line: colored blocks for each theme color + name.
 fn palette_swatch<'a>() -> Line<'a> {
-    let f = flavor();
-    let accents = [
-        f.rosewater, f.flamingo, f.pink, f.mauve, f.red, f.maroon, f.peach,
-        f.yellow, f.green, f.teal, f.sky, f.sapphire, f.blue, f.lavender,
-    ];
+    let t = theme();
     let mut spans: Vec<Span<'a>> = vec![Span::raw(" ")];
-    for c in accents {
-        spans.push(Span::styled("█", Style::default().fg(ctp(c))));
+    for &c in &t.swatch {
+        spans.push(Span::styled("█", Style::default().fg(c)));
     }
     spans.push(Span::styled(
-        format!(" {} ", palette_name()),
-        Style::default().fg(ctp(f.subtext0)),
+        format!(" {} ", t.name),
+        Style::default().fg(t.on_surface_variant),
     ));
     Line::from(spans)
 }
 
 /// Cycle to the next palette and return its name.
 fn cycle_palette() -> &'static str {
-    let next = (PALETTE_IDX.load(Ordering::Relaxed) + 1) % 4;
+    let next = (PALETTE_IDX.load(Ordering::Relaxed) + 1) % PALETTE_COUNT;
     PALETTE_IDX.store(next, Ordering::Relaxed);
-    Palette::from_index(next).name()
+    theme().name
 }
 
 /// Get the list of active filter names for TUI display.
@@ -93,11 +197,6 @@ fn ignored_paths() -> &'static [String] {
     IGNORED_PATHS.get().map_or(&[], |v| v.as_slice())
 }
 
-/// Convert a catppuccin color to ratatui Color.
-fn ctp(color: catppuccin::Color) -> Color {
-    color.into()
-}
-
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -108,42 +207,17 @@ enum Palette {
     Frappe,
     Macchiato,
     Mocha,
+    Eldritch,
 }
 
 impl Palette {
-    fn flavor_colors(self) -> &'static catppuccin::FlavorColors {
-        match self {
-            Palette::Latte => &catppuccin::PALETTE.latte.colors,
-            Palette::Frappe => &catppuccin::PALETTE.frappe.colors,
-            Palette::Macchiato => &catppuccin::PALETTE.macchiato.colors,
-            Palette::Mocha => &catppuccin::PALETTE.mocha.colors,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Palette::Latte => "latte",
-            Palette::Frappe => "frappe",
-            Palette::Macchiato => "macchiato",
-            Palette::Mocha => "mocha",
-        }
-    }
-
     fn to_index(self) -> u8 {
         match self {
             Palette::Latte => 0,
             Palette::Frappe => 1,
             Palette::Macchiato => 2,
             Palette::Mocha => 3,
-        }
-    }
-
-    fn from_index(idx: u8) -> Self {
-        match idx {
-            0 => Palette::Latte,
-            1 => Palette::Frappe,
-            2 => Palette::Macchiato,
-            _ => Palette::Mocha,
+            Palette::Eldritch => 4,
         }
     }
 }
@@ -155,7 +229,7 @@ impl Palette {
     version
 )]
 struct Args {
-    /// Catppuccin palette (latte, frappe, macchiato, mocha)
+    /// Color palette (latte, frappe, macchiato, mocha, eldritch)
     #[arg(long, value_enum, default_value = "mocha", env = "FIND_UNUSED_PUB_PALETTE")]
     palette: Palette,
     /// Crate paths to scan (defaults to all crates/*)
@@ -249,10 +323,10 @@ impl SkipReason {
         // Find the matching filter to get its configured color
         for f in all_filters() {
             if f.name() == filter_name {
-                return ctp(f.label_color());
+                return f.label_color();
             }
         }
-        ctp(flavor().overlay0)
+        theme().dim
     }
 }
 
@@ -269,8 +343,8 @@ trait SymbolFilter: Send + Sync {
     /// Short lowercase name shown in CLI / TUI (e.g. "graphql", "orm").
     fn name(&self) -> &'static str;
 
-    /// Catppuccin color used for the `[name]` label in the TUI.
-    fn label_color(&self) -> catppuccin::Color;
+    /// Color used for the `[name]` label in the TUI.
+    fn label_color(&self) -> Color;
 
     /// Whether this filter is enabled by default.
     /// Opt-in filters (like cynic) return `false` here.
@@ -301,8 +375,8 @@ impl SymbolFilter for OrmFilter {
         "orm"
     }
 
-    fn label_color(&self) -> catppuccin::Color {
-        flavor().teal
+    fn label_color(&self) -> Color {
+        theme().filter_colors[0]
     }
 
     fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(PubSymbol, SkipReason)>) {
@@ -330,8 +404,8 @@ impl SymbolFilter for GraphqlFilter {
         "graphql"
     }
 
-    fn label_color(&self) -> catppuccin::Color {
-        flavor().mauve
+    fn label_color(&self) -> Color {
+        theme().filter_colors[1]
     }
 
     fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(PubSymbol, SkipReason)>) {
@@ -347,8 +421,8 @@ impl SymbolFilter for BuilderFilter {
         "builder"
     }
 
-    fn label_color(&self) -> catppuccin::Color {
-        flavor().peach
+    fn label_color(&self) -> Color {
+        theme().filter_colors[2]
     }
 
     fn aliases(&self, symbols: &[PubSymbol]) -> HashMap<String, String> {
@@ -365,8 +439,8 @@ impl SymbolFilter for CynicFilter {
         "cynic"
     }
 
-    fn label_color(&self) -> catppuccin::Color {
-        flavor().sky
+    fn label_color(&self) -> Color {
+        theme().filter_colors[3]
     }
 
     fn default_enabled(&self) -> bool {
@@ -2211,17 +2285,17 @@ fn config_status_lines(dim: Style) -> Vec<Line<'static>> {
 
     if has_disabled || has_enabled || has_ignored {
         let mut spans: Vec<Span> = vec![
-            Span::styled("  config ", Style::default().fg(ctp(flavor().subtext0)).add_modifier(Modifier::BOLD)),
+            Span::styled("  config ", Style::default().fg(theme().on_surface_variant).add_modifier(Modifier::BOLD)),
         ];
 
         // Active filters
         spans.push(Span::styled("filters: ", dim));
         if filters.is_empty() {
-            spans.push(Span::styled("none", Style::default().fg(ctp(flavor().red))));
+            spans.push(Span::styled("none", Style::default().fg(theme().error)));
         } else {
             spans.push(Span::styled(
                 filters.join(", "),
-                Style::default().fg(ctp(flavor().green)),
+                Style::default().fg(theme().success),
             ));
         }
 
@@ -2230,7 +2304,7 @@ fn config_status_lines(dim: Style) -> Vec<Line<'static>> {
             spans.push(Span::styled("  disabled: ", dim));
             spans.push(Span::styled(
                 disabled.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-                Style::default().fg(ctp(flavor().red)),
+                Style::default().fg(theme().error),
             ));
         }
 
@@ -2239,7 +2313,7 @@ fn config_status_lines(dim: Style) -> Vec<Line<'static>> {
             spans.push(Span::styled("  opt-in: ", dim));
             spans.push(Span::styled(
                 enabled.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-                Style::default().fg(ctp(flavor().sky)),
+                Style::default().fg(theme().info),
             ));
         }
 
@@ -2248,7 +2322,7 @@ fn config_status_lines(dim: Style) -> Vec<Line<'static>> {
             spans.push(Span::styled("  ignoring: ", dim));
             spans.push(Span::styled(
                 ignored.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-                Style::default().fg(ctp(flavor().peach)),
+                Style::default().fg(theme().tertiary),
             ));
         }
 
@@ -2260,7 +2334,7 @@ fn config_status_lines(dim: Style) -> Vec<Line<'static>> {
 }
 
 fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
-    let dim = Style::default().fg(ctp(flavor().overlay0));
+    let dim = Style::default().fg(theme().dim);
     let scan = app.scan.as_ref().unwrap();
 
     let done_count = scan.completed.iter().filter(|c| c.is_some()).count();
@@ -2279,7 +2353,7 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         done_count,
         total,
         elapsed.as_secs_f64(),
-        palette_name(),
+        theme().name,
     );
 
     let mut lines: Vec<Line> = vec![];
@@ -2300,8 +2374,8 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
                 .count();
 
             let mut spans = vec![
-                Span::styled("  ✅ ", Style::default().fg(ctp(flavor().green))),
-                Span::styled(name_padded, Style::default().fg(ctp(flavor().sapphire))),
+                Span::styled("  ✅ ", Style::default().fg(theme().success)),
+                Span::styled(name_padded, Style::default().fg(theme().secondary)),
                 Span::raw("  "),
                 Span::styled(format!("{:>3} found", result.items_found), dim),
             ];
@@ -2310,19 +2384,19 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     format!("❗ {n_unused} unused"),
-                    Style::default().fg(ctp(flavor().red)),
+                    Style::default().fg(theme().error),
                 ));
             }
             if n_internal > 0 {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     format!("🔧 {n_internal} internal"),
-                    Style::default().fg(ctp(flavor().yellow)),
+                    Style::default().fg(theme().warning),
                 ));
             }
             if n_unused == 0 && n_internal == 0 {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled("✨ clean", Style::default().fg(ctp(flavor().green))));
+                spans.push(Span::styled("✨ clean", Style::default().fg(theme().success)));
             }
 
             lines.push(Line::from(spans));
@@ -2331,11 +2405,11 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
             let stage_span = if stage.is_empty() {
                 Span::styled("waiting…", dim)
             } else {
-                Span::styled(stage.as_str(), Style::default().fg(ctp(flavor().peach)))
+                Span::styled(stage.as_str(), Style::default().fg(theme().tertiary))
             };
             lines.push(Line::from(vec![
-                Span::styled("  ⏳ ", Style::default().fg(ctp(flavor().peach))),
-                Span::styled(name_padded, Style::default().fg(ctp(flavor().subtext0))),
+                Span::styled("  ⏳ ", Style::default().fg(theme().tertiary)),
+                Span::styled(name_padded, Style::default().fg(theme().on_surface_variant)),
                 Span::raw("  "),
                 stage_span,
             ]));
@@ -2353,31 +2427,31 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(flavor().surface2)))
+                .border_style(Style::default().fg(theme().outline))
                 .title(title)
-                .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(widget, rows[0]);
 
     let bar = Paragraph::new(Line::from(vec![
-        Span::styled(" p", Style::default().fg(ctp(flavor().peach)).add_modifier(Modifier::BOLD)),
+        Span::styled(" p", Style::default().fg(theme().tertiary).add_modifier(Modifier::BOLD)),
         Span::styled(": palette  ", dim),
-        Span::styled("PgUp/PgDn", Style::default().fg(ctp(flavor().peach)).add_modifier(Modifier::BOLD)),
+        Span::styled("PgUp/PgDn", Style::default().fg(theme().tertiary).add_modifier(Modifier::BOLD)),
         Span::styled(": scroll  ", dim),
-        Span::styled("q", Style::default().fg(ctp(flavor().peach)).add_modifier(Modifier::BOLD)),
+        Span::styled("q", Style::default().fg(theme().tertiary).add_modifier(Modifier::BOLD)),
         Span::styled(": quit", dim),
     ]))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ctp(flavor().surface2)))
+            .border_style(Style::default().fg(theme().outline))
             .title_bottom(palette_swatch()),
     );
     frame.render_widget(bar, rows[1]);
 }
 
 fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
-    let dim = Style::default().fg(ctp(flavor().overlay0));
+    let dim = Style::default().fg(theme().dim);
 
     // Layout: content area + menu at bottom
     let rows = Layout::vertical([
@@ -2396,7 +2470,7 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         app.results.len(),
         app.elapsed.as_secs_f64(),
         view_label,
-        palette_name(),
+        theme().name,
     );
 
     match app.summary_view {
@@ -2413,16 +2487,16 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         .map(|(i, (action, label))| {
             let style = if i == app.summary_selected {
                 Style::default()
-                    .fg(ctp(flavor().base))
-                    .bg(ctp(flavor().lavender))
+                    .fg(theme().surface)
+                    .bg(theme().primary)
                     .add_modifier(Modifier::BOLD)
             } else {
                 match action {
-                    SummaryAction::ReviewUnused => Style::default().fg(ctp(flavor().green)),
-                    SummaryAction::ReviewCrateInternal => Style::default().fg(ctp(flavor().sapphire)),
-                    SummaryAction::FixAllUnused => Style::default().fg(ctp(flavor().red)),
-                    SummaryAction::FixAllCrateInternal => Style::default().fg(ctp(flavor().green)),
-                    SummaryAction::Quit => Style::default().fg(ctp(flavor().text)),
+                    SummaryAction::ReviewUnused => Style::default().fg(theme().success),
+                    SummaryAction::ReviewCrateInternal => Style::default().fg(theme().secondary),
+                    SummaryAction::FixAllUnused => Style::default().fg(theme().error),
+                    SummaryAction::FixAllCrateInternal => Style::default().fg(theme().success),
+                    SummaryAction::Quit => Style::default().fg(theme().on_surface),
                 }
             };
             ListItem::new(label.as_str()).style(style)
@@ -2433,9 +2507,9 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(flavor().surface2)))
+                .border_style(Style::default().fg(theme().outline))
                 .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, PgUp/PgDn: scroll, p: palette, q: quit) ")
-                .title_style(Style::default().fg(ctp(flavor().peach)))
+                .title_style(Style::default().fg(theme().tertiary))
                 .title_bottom(palette_swatch()),
         )
         .highlight_symbol("▸ ");
@@ -2475,7 +2549,7 @@ fn draw_summary_table(
         let found_str = format!("{:>3} found", result.items_found);
 
         let mut spans = vec![
-            Span::styled(name_padded, Style::default().fg(ctp(flavor().sapphire))),
+            Span::styled(name_padded, Style::default().fg(theme().secondary)),
             Span::raw("  "),
             Span::styled(found_str, dim),
         ];
@@ -2484,19 +2558,19 @@ fn draw_summary_table(
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
                 format!("❗ {n_unused} unused"),
-                Style::default().fg(ctp(flavor().red)),
+                Style::default().fg(theme().error),
             ));
         }
         if n_internal > 0 {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
                 format!("🔧 {n_internal} internal"),
-                Style::default().fg(ctp(flavor().yellow)),
+                Style::default().fg(theme().warning),
             ));
         }
         if n_unused == 0 && n_internal == 0 {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled("✨ clean", Style::default().fg(ctp(flavor().green))));
+            spans.push(Span::styled("✨ clean", Style::default().fg(theme().success)));
         }
 
         table_lines.push(Line::from(spans));
@@ -2518,7 +2592,7 @@ fn draw_summary_table(
     let mut total_spans = vec![
         Span::styled(
             format!("{:<width$}", "TOTAL", width = max_name_len),
-            Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().on_surface).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(format!("{:>3} found", total_found), dim),
@@ -2527,7 +2601,7 @@ fn draw_summary_table(
         total_spans.push(Span::raw("  "));
         total_spans.push(Span::styled(
             format!("❗ {total_unused} unused"),
-            Style::default().fg(ctp(flavor().red)).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().error).add_modifier(Modifier::BOLD),
         ));
     }
     if total_internal > 0 {
@@ -2535,7 +2609,7 @@ fn draw_summary_table(
         total_spans.push(Span::styled(
             format!("🔧 {total_internal} internal"),
             Style::default()
-                .fg(ctp(flavor().yellow))
+                .fg(theme().warning)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -2544,7 +2618,7 @@ fn draw_summary_table(
         total_spans.push(Span::styled(
             "✨ all clean!",
             Style::default()
-                .fg(ctp(flavor().green))
+                .fg(theme().success)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -2555,9 +2629,9 @@ fn draw_summary_table(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(flavor().surface2)))
+                .border_style(Style::default().fg(theme().outline))
                 .title(title.to_string())
-                .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(table_widget, area);
 }
@@ -2575,7 +2649,7 @@ fn draw_summary_detail(
     lines.push(Line::from(vec![
         Span::styled(
             format!("📋 {total_unused} issues"),
-            Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().on_surface).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled("j/k: navigate crates, PgUp/PgDn: scroll, Space: expand/collapse", dim),
@@ -2598,17 +2672,17 @@ fn draw_summary_detail(
 
         let name_style = if is_focused {
             Style::default()
-                .fg(ctp(flavor().sapphire))
+                .fg(theme().secondary)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default()
-                .fg(ctp(flavor().sapphire))
+                .fg(theme().secondary)
                 .add_modifier(Modifier::BOLD)
         };
 
         let mut header_spans = vec![
-            Span::styled(cursor_indicator, Style::default().fg(ctp(flavor().lavender))),
-            Span::styled(format!("{arrow} "), Style::default().fg(ctp(flavor().overlay1))),
+            Span::styled(cursor_indicator, Style::default().fg(theme().primary)),
+            Span::styled(format!("{arrow} "), Style::default().fg(theme().dim_accent)),
             Span::styled(&result.crate_name, name_style),
             Span::raw(" "),
             Span::styled(
@@ -2620,14 +2694,14 @@ fn draw_summary_detail(
             header_spans.push(Span::raw("  "));
             header_spans.push(Span::styled(
                 format!("❗ {n_unused}"),
-                Style::default().fg(ctp(flavor().red)),
+                Style::default().fg(theme().error),
             ));
         }
         if n_internal > 0 {
             header_spans.push(Span::raw("  "));
             header_spans.push(Span::styled(
                 format!("🔧 {n_internal}"),
-                Style::default().fg(ctp(flavor().yellow)),
+                Style::default().fg(theme().warning),
             ));
         }
         lines.push(Line::from(header_spans));
@@ -2640,7 +2714,7 @@ fn draw_summary_detail(
                             Span::raw("      "),
                             Span::styled(
                                 format!("❗ {}", item.symbol.name),
-                                Style::default().fg(ctp(flavor().red)),
+                                Style::default().fg(theme().error),
                             ),
                             Span::raw(" "),
                             Span::styled("unused everywhere", dim),
@@ -2651,7 +2725,7 @@ fn draw_summary_detail(
                             Span::raw("      "),
                             Span::styled(
                                 format!("🔧 {}", item.symbol.name),
-                                Style::default().fg(ctp(flavor().yellow)),
+                                Style::default().fg(theme().warning),
                             ),
                             Span::raw(" "),
                             Span::styled(
@@ -2668,7 +2742,7 @@ fn draw_summary_detail(
                     .unwrap_or(&item.symbol.file);
                 lines.push(Line::from(Span::styled(
                     format!("        {}:{}", rel_path.display(), item.symbol.line),
-                    Style::default().fg(ctp(flavor().subtext0)),
+                    Style::default().fg(theme().on_surface_variant),
                 )));
                 for (ref_file, ref_line) in &item.internal_refs {
                     let rel = ref_file
@@ -2676,7 +2750,7 @@ fn draw_summary_detail(
                         .unwrap_or(ref_file);
                     lines.push(Line::from(Span::styled(
                         format!("          ↳ {}:{}", rel.display(), ref_line),
-                        Style::default().fg(ctp(flavor().overlay1)),
+                        Style::default().fg(theme().dim_accent),
                     )));
                 }
             }
@@ -2694,9 +2768,9 @@ fn draw_summary_detail(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(flavor().surface2)))
+                .border_style(Style::default().fg(theme().outline))
                 .title(title.to_string())
-                .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(detail_widget, area);
 }
@@ -2714,7 +2788,7 @@ fn draw_summary_skipped(
     lines.push(Line::from(vec![
         Span::styled(
             format!("🛡️  {total_skipped} symbols skipped"),
-            Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().on_surface).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(format!("({})", active_filter_names().join(", ")), dim),
@@ -2738,17 +2812,17 @@ fn draw_summary_skipped(
 
         let name_style = if is_focused {
             Style::default()
-                .fg(ctp(flavor().sapphire))
+                .fg(theme().secondary)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default()
-                .fg(ctp(flavor().sapphire))
+                .fg(theme().secondary)
                 .add_modifier(Modifier::BOLD)
         };
 
         lines.push(Line::from(vec![
-            Span::styled(cursor_indicator, Style::default().fg(ctp(flavor().lavender))),
-            Span::styled(format!("{arrow} "), Style::default().fg(ctp(flavor().overlay1))),
+            Span::styled(cursor_indicator, Style::default().fg(theme().primary)),
+            Span::styled(format!("{arrow} "), Style::default().fg(theme().dim_accent)),
             Span::styled(&result.crate_name, name_style),
             Span::raw(" "),
             Span::styled(
@@ -2765,12 +2839,12 @@ fn draw_summary_skipped(
                     .unwrap_or(&sym.file);
                 lines.push(Line::from(vec![
                     Span::raw("      "),
-                    Span::styled(&sym.name, Style::default().fg(ctp(flavor().subtext0))),
+                    Span::styled(&sym.name, Style::default().fg(theme().on_surface_variant)),
                     Span::styled(reason.label(), Style::default().fg(reason.label_color())),
                     Span::raw("  "),
                     Span::styled(
                         format!("{}:{}", rel.display(), sym.line),
-                        Style::default().fg(ctp(flavor().overlay0)),
+                        Style::default().fg(theme().dim),
                     ),
                 ]));
             }
@@ -2788,9 +2862,9 @@ fn draw_summary_skipped(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(flavor().surface2)))
+                .border_style(Style::default().fg(theme().outline))
                 .title(title.to_string())
-                .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(widget, area);
 }
@@ -2804,8 +2878,8 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .file
         .strip_prefix(&app.workspace_root)
         .unwrap_or(&item.symbol.file);
-    let dim = Style::default().fg(ctp(flavor().overlay0));
-    let label_style = Style::default().fg(ctp(flavor().peach));
+    let dim = Style::default().fg(theme().dim);
+    let label_style = Style::default().fg(theme().tertiary);
 
     let is_definition_only = matches!(
         &app.git_states[app.current],
@@ -2835,24 +2909,24 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
 
     // -- Symbol info (top-left) --
     let kind_label = match item.kind {
-        SymbolKind::UnusedAnywhere => Span::styled("❗ unused everywhere", Style::default().fg(ctp(flavor().red))),
+        SymbolKind::UnusedAnywhere => Span::styled("❗ unused everywhere", Style::default().fg(theme().error)),
         SymbolKind::CrateInternalOnly { refs } => Span::styled(
             format!("🔧 crate-internal only ({refs} refs)"),
-            Style::default().fg(ctp(flavor().yellow)),
+            Style::default().fg(theme().warning),
         ),
     };
     let symbol_text = Text::from(vec![
         Line::from(vec![
             Span::styled(
                 &item.symbol.name,
-                Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme().on_surface).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             kind_label,
         ]),
         Line::from(Span::styled(
             format!("{}:{}", rel_path.display(), item.symbol.line),
-            Style::default().fg(ctp(flavor().subtext0)),
+            Style::default().fg(theme().on_surface_variant),
         )),
     ]);
     let review_title = if is_definition_only {
@@ -2861,16 +2935,16 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         format!(" 🔍 Review ({}/{}) ", app.current + 1, total)
     };
     let symbol_border_style = if is_definition_only {
-        Style::default().fg(ctp(flavor().green))
+        Style::default().fg(theme().success)
     } else {
-        Style::default().fg(ctp(flavor().surface2))
+        Style::default().fg(theme().outline)
     };
     let symbol_block = Paragraph::new(symbol_text).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(symbol_border_style)
             .title(review_title)
-            .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
+            .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
     );
     frame.render_widget(symbol_block, left_rows[0]);
 
@@ -2897,7 +2971,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
             if let Some(blame) = &info.blame {
                 lines.push(Line::from(vec![
                     Span::styled("📝 Line last modified ", label_style),
-                    Span::styled(&blame.age, Style::default().fg(ctp(flavor().mauve))),
+                    Span::styled(&blame.age, Style::default().fg(theme().accent)),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -2907,9 +2981,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(&blame.short_hash, Style::default().fg(ctp(flavor().sapphire))),
+                    Span::styled(&blame.short_hash, Style::default().fg(theme().secondary)),
                     Span::raw(" "),
-                    Span::styled(&blame.summary, Style::default().fg(ctp(flavor().text))),
+                    Span::styled(&blame.summary, Style::default().fg(theme().on_surface)),
                 ]));
                 lines.push(Line::from(Span::styled(
                     format!("  $ git show {}", blame.short_hash),
@@ -2923,7 +2997,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 }
                 lines.push(Line::from(vec![
                     Span::styled("🔎 Symbol last added/removed ", label_style),
-                    Span::styled(&entry.age, Style::default().fg(ctp(flavor().mauve))),
+                    Span::styled(&entry.age, Style::default().fg(theme().accent)),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -2933,9 +3007,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(&entry.short_hash, Style::default().fg(ctp(flavor().sapphire))),
+                    Span::styled(&entry.short_hash, Style::default().fg(theme().secondary)),
                     Span::raw(" "),
-                    Span::styled(&entry.subject, Style::default().fg(ctp(flavor().text))),
+                    Span::styled(&entry.subject, Style::default().fg(theme().on_surface)),
                 ]));
                 lines.push(Line::from(Span::styled(
                     format!("  $ git show {}", entry.short_hash),
@@ -2957,9 +3031,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(flavor().surface2)))
+                .border_style(Style::default().fg(theme().outline))
                 .title(" 🕰️  Git context ")
-                .title_style(Style::default().fg(ctp(flavor().peach))),
+                .title_style(Style::default().fg(theme().tertiary)),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(git_block, left_rows[1]);
@@ -2978,9 +3052,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 )));
                 for m in &entry.diff_matches {
                     let style = if m.starts_with('+') {
-                        Style::default().fg(ctp(flavor().green))
+                        Style::default().fg(theme().success)
                     } else {
-                        Style::default().fg(ctp(flavor().red))
+                        Style::default().fg(theme().error)
                     };
                     patch_lines.push(Line::from(Span::styled(m.as_str(), style)));
                 }
@@ -2988,13 +3062,13 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
             }
             for patch_line in entry.patch.lines().skip(app.scroll_offset as usize) {
                 let style = if patch_line.starts_with('+') && !patch_line.starts_with("+++") {
-                    Style::default().fg(ctp(flavor().green))
+                    Style::default().fg(theme().success)
                 } else if patch_line.starts_with('-') && !patch_line.starts_with("---") {
-                    Style::default().fg(ctp(flavor().red))
+                    Style::default().fg(theme().error)
                 } else if patch_line.starts_with("@@") {
-                    Style::default().fg(ctp(flavor().sky))
+                    Style::default().fg(theme().info)
                 } else {
-                    Style::default().fg(ctp(flavor().overlay0))
+                    Style::default().fg(theme().dim)
                 };
                 patch_lines.push(Line::from(Span::styled(patch_line, style)));
             }
@@ -3014,9 +3088,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(flavor().surface2)))
+                .border_style(Style::default().fg(theme().outline))
                 .title(patch_title)
-                .title_style(Style::default().fg(ctp(flavor().peach))),
+                .title_style(Style::default().fg(theme().tertiary)),
         );
     frame.render_widget(patch_block, cols[1]);
 
@@ -3039,11 +3113,11 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .map(|(i, label)| {
             let style = if i == app.selected_action {
                 Style::default()
-                    .fg(ctp(flavor().base))
-                    .bg(ctp(flavor().lavender))
+                    .fg(theme().surface)
+                    .bg(theme().primary)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(ctp(flavor().text))
+                Style::default().fg(theme().on_surface)
             };
             ListItem::new(*label).style(style)
         })
@@ -3053,9 +3127,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(flavor().surface2)))
+                .border_style(Style::default().fg(theme().outline))
                 .title(" ⚡ Action (f/a/s or ↑↓+Enter, j/k scroll, q quit) ")
-                .title_style(Style::default().fg(ctp(flavor().peach)))
+                .title_style(Style::default().fg(theme().tertiary))
                 .title_bottom(palette_swatch()),
         )
         .highlight_symbol("▸ ");
@@ -3069,6 +3143,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    THEMES.set(build_all_themes()).expect("themes already set");
     PALETTE_IDX.store(args.palette.to_index(), Ordering::Relaxed);
 
     // Validate --disable-filter and --enable-filter values

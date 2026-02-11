@@ -1,6 +1,6 @@
 # find-unused-pub
 
-Find `pub` items in a Rust workspace that are either unused entirely or only used within their own crate. Ships with a full TUI (ratatui + catppuccin) for browsing results, reviewing items interactively, and applying fixes.
+Find `pub` items in a Rust workspace that are either unused entirely or only used within their own crate. Ships with a full TUI (ratatui) for browsing results, reviewing items interactively, and applying fixes. Includes catppuccin and [eldritch](https://github.com/eldritch-theme/eldritch) color themes.
 
 ## Install
 
@@ -34,8 +34,9 @@ find-unused-pub --disable-filter graphql
 # Enable an opt-in filter (e.g. cynic for cynic-rs projects)
 find-unused-pub --enable-filter cynic
 
-# Use a different catppuccin palette
+# Use a different palette
 find-unused-pub --palette latte
+find-unused-pub --palette eldritch
 
 # Auto-fix crate-internal items → pub(crate)
 find-unused-pub --fix crates/auth
@@ -51,7 +52,7 @@ find-unused-pub --nuke-whitelist
 
 | Flag | Description |
 |------|-------------|
-| `--palette <name>` | Catppuccin theme: `latte`, `frappe`, `macchiato`, `mocha` (default) |
+| `--palette <name>` | Color theme: `latte`, `frappe`, `macchiato`, `mocha` (default), `eldritch` |
 | `--ignore <path>` | Skip a crate path (repeatable, relative to workspace root) |
 | `--disable-filter <name>` | Turn off a filter plugin (repeatable, see [Filters](#filters)) |
 | `--enable-filter <name>` | Turn on an opt-in filter plugin (repeatable, see [Filters](#filters)) |
@@ -68,7 +69,7 @@ Set these in your `.envrc` or shell profile to avoid repeating flags:
 
 | Variable | Example | Description |
 |----------|---------|-------------|
-| `FIND_UNUSED_PUB_PALETTE` | `latte` | Initial catppuccin palette |
+| `FIND_UNUSED_PUB_PALETTE` | `latte` | Initial color palette |
 | `FIND_UNUSED_PUB_IGNORE` | `crates/app,crates/cli` | Comma-separated crate paths to skip |
 | `FIND_UNUSED_PUB_DISABLE_FILTER` | `graphql` | Comma-separated filter names to disable |
 | `FIND_UNUSED_PUB_ENABLE_FILTER` | `cynic` | Comma-separated opt-in filter names to enable |
@@ -90,7 +91,7 @@ The default mode launches an interactive TUI with three phases:
 | `Tab` | Cycle summary views (table / detail / skipped) |
 | `j` / `k` | Scroll or navigate crates |
 | `Space` | Expand/collapse a crate in detail/skipped view |
-| `p` | Cycle catppuccin palette live |
+| `p` | Cycle palette live |
 | `q` | Quit |
 | `r` | Review unused items |
 | `i` | Review crate-internal items |
