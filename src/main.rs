@@ -2848,8 +2848,7 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         );
     frame.render_widget(widget, rows[0]);
 
-    let eq = Paragraph::new(eq_widget(app.crab_tick, rows[1].width, rows[1].height))
-        .style(Style::default().bg(theme().surface));
+    let eq = Paragraph::new(eq_widget(app.crab_tick, rows[1].width, rows[1].height));
     frame.render_widget(eq, rows[1]);
 
     let bar = Paragraph::new(Line::from(vec![
@@ -2902,8 +2901,7 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
     }
 
     // -- EQ visualizer --
-    let eq = Paragraph::new(eq_widget(app.crab_tick, rows[1].width, rows[1].height))
-        .style(Style::default().bg(theme().surface));
+    let eq = Paragraph::new(eq_widget(app.crab_tick, rows[1].width, rows[1].height));
     frame.render_widget(eq, rows[1]);
 
     // -- Menu (shared by all views) --
@@ -3524,8 +3522,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp, crab_tick: u16) {
     frame.render_widget(patch_block, cols[1]);
 
     // -- EQ visualizer --
-    let eq = Paragraph::new(eq_widget(crab_tick, rows[1].width, rows[1].height))
-        .style(Style::default().bg(theme().surface));
+    let eq = Paragraph::new(eq_widget(crab_tick, rows[1].width, rows[1].height));
     frame.render_widget(eq, rows[1]);
 
     // -- Action selector (bottom, full width) --
