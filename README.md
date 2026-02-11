@@ -31,6 +31,9 @@ find-unused-pub --ignore crates/app
 # Disable the graphql filter (faster if you don't use async-graphql)
 find-unused-pub --disable-filter graphql
 
+# Enable an opt-in filter (e.g. cynic for cynic-rs projects)
+find-unused-pub --enable-filter cynic
+
 # Use a different catppuccin palette
 find-unused-pub --palette latte
 
@@ -54,6 +57,7 @@ find-unused-pub --nuke-whitelist
 | `--palette <name>` | Catppuccin theme: `latte`, `frappe`, `macchiato`, `mocha` (default) |
 | `--ignore <path>` | Skip a crate path (repeatable, relative to workspace root) |
 | `--disable-filter <name>` | Turn off a filter plugin (repeatable, see [Filters](#filters)) |
+| `--enable-filter <name>` | Turn on an opt-in filter plugin (repeatable, see [Filters](#filters)) |
 | `--fix` | Alias for `--fix-crate-internal` |
 | `--fix-crate-internal` | Auto-fix crate-internal items to `pub(crate)` |
 | `--fix-unused` | Auto-fix unused items by deleting them entirely |
@@ -73,6 +77,7 @@ Set these in your `.envrc` or shell profile to avoid repeating flags:
 | `FIND_UNUSED_PUB_PALETTE` | `latte` | Initial catppuccin palette |
 | `FIND_UNUSED_PUB_IGNORE` | `crates/app,crates/cli` | Comma-separated crate paths to skip |
 | `FIND_UNUSED_PUB_DISABLE_FILTER` | `graphql` | Comma-separated filter names to disable |
+| `FIND_UNUSED_PUB_ENABLE_FILTER` | `cynic` | Comma-separated opt-in filter names to enable |
 
 CLI flags override environment variables when both are set.
 
@@ -101,13 +106,21 @@ The TUI title bar and config block show the active palette, enabled filters, dis
 
 ## Filters
 
-Filters are modular plugins that exempt symbols from analysis. All ship enabled by default (batteries included). Disable any with `--disable-filter <name>`.
+Filters are modular plugins that exempt symbols from analysis. Most ship enabled by default (batteries included). Disable any with `--disable-filter <name>`. Opt-in filters must be explicitly enabled with `--enable-filter <name>`.
+
+### Default-on
 
 | Filter | What it does |
 |--------|--------------|
 | `orm` | Skips sea-orm derive names: `Model`, `Entity`, `Column`, `Relation`, `ActiveModel`, `ActiveModelBehavior` |
 | `graphql` | Skips items with async-graphql attributes: `#[Object]`, `#[derive(SimpleObject)]`, `#[Mutation]`, etc. Shows the specific attribute in the TUI (e.g. `[graphql:SimpleObject]`) |
 | `builder` | Detects `#[derive(Builder)]` and searches for `{Name}Builder` aliases so builder-pattern structs aren't falsely reported |
+
+### Opt-in
+
+| Filter  | What it does                                                                                                                                                                      |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `cynic` | Skips items with cynic derive attributes: `#[derive(cynic::QueryFragment)]`, `#[derive(cynic::InputObject)]`, etc. Shows the specific attribute (e.g. `[cynic:QueryFragment]`) |
 
 ## How it works
 
