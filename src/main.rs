@@ -31,6 +31,8 @@ use rusqlite::Connection;
 
 static FLAVOR: OnceLock<&'static catppuccin::FlavorColors> = OnceLock::new();
 static PALETTE_NAME: OnceLock<&'static str> = OnceLock::new();
+static ACTIVE_FILTER_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+static IGNORED_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Get the active catppuccin flavor (set at startup via --palette).
 fn flavor() -> &'static catppuccin::FlavorColors {
@@ -40,6 +42,16 @@ fn flavor() -> &'static catppuccin::FlavorColors {
 /// Get the active palette name for display.
 fn palette_name() -> &'static str {
     PALETTE_NAME.get().copied().unwrap_or("mocha")
+}
+
+/// Get the list of active filter names for TUI display.
+fn active_filter_names() -> &'static [&'static str] {
+    ACTIVE_FILTER_NAMES.get().map_or(&[], |v| v.as_slice())
+}
+
+/// Get the list of ignored paths for TUI display.
+fn ignored_paths() -> &'static [String] {
+    IGNORED_PATHS.get().map_or(&[], |v| v.as_slice())
 }
 
 /// Convert a catppuccin color to ratatui Color.
@@ -119,6 +131,14 @@ struct Args {
     /// Clear the whitelist database
     #[arg(long)]
     nuke_whitelist: bool,
+
+    /// Ignore crate paths (relative to workspace root, repeatable)
+    #[arg(long)]
+    ignore: Vec<PathBuf>,
+
+    /// Disable a filter plugin by name (repeatable, e.g. --disable-filter graphql)
+    #[arg(long)]
+    disable_filter: Vec<String>,
 }
 
 impl Args {
@@ -161,6 +181,143 @@ struct UnusedSymbol {
 enum SkipReason {
     Graphql(&'static str),
     Orm,
+}
+
+impl SkipReason {
+    /// Display label for the TUI, e.g. "[graphql:SimpleObject]" or "[orm]".
+    fn label(&self) -> String {
+        match self {
+            SkipReason::Graphql(attr) => format!(" [graphql:{attr}]"),
+            SkipReason::Orm => " [orm]".to_string(),
+        }
+    }
+
+    /// Resolve the label color by looking up the corresponding filter plugin.
+    fn label_color(&self) -> Color {
+        let filter_name = match self {
+            SkipReason::Graphql(_) => "graphql",
+            SkipReason::Orm => "orm",
+        };
+        // Find the matching filter to get its configured color
+        for f in all_filters() {
+            if f.name() == filter_name {
+                return ctp(f.label_color());
+            }
+        }
+        ctp(flavor().overlay0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filter plugin system
+// ---------------------------------------------------------------------------
+
+/// A named, toggleable plugin that participates in crate analysis.
+///
+/// Plugins can do two things (both optional, override as needed):
+/// - **Filter**: partition symbols into kept vs skipped (ORM, GraphQL).
+/// - **Alias**: provide alternative search names (derive_builder).
+trait SymbolFilter: Send + Sync {
+    /// Short lowercase name shown in CLI / TUI (e.g. "graphql", "orm").
+    fn name(&self) -> &'static str;
+
+    /// Catppuccin color used for the `[name]` label in the TUI.
+    fn label_color(&self) -> catppuccin::Color;
+
+    /// Partition `symbols` into (kept, skipped).
+    /// Called once per crate after `collect_pub_symbols`.
+    /// Default: keep everything.
+    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(String, SkipReason)>) {
+        (symbols, vec![])
+    }
+
+    /// Provide additional search aliases for symbols.
+    /// Returns a map of original_name → alias_name.
+    /// Default: no aliases.
+    fn aliases(&self, _symbols: &[PubSymbol]) -> HashMap<String, String> {
+        HashMap::new()
+    }
+}
+
+/// ORM filter — skips well-known sea-orm derive names (Model, Entity, …).
+struct OrmFilter;
+
+impl SymbolFilter for OrmFilter {
+    fn name(&self) -> &'static str {
+        "orm"
+    }
+
+    fn label_color(&self) -> catppuccin::Color {
+        flavor().teal
+    }
+
+    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(String, SkipReason)>) {
+        let mut kept = vec![];
+        let mut skipped = vec![];
+        for sym in symbols {
+            if SKIP_SYMBOLS.contains(&sym.name.as_str()) {
+                skipped.push((sym.name, SkipReason::Orm));
+            } else {
+                kept.push(sym);
+            }
+        }
+        // Deduplicate skipped names
+        let mut seen = HashSet::new();
+        skipped.retain(|(name, _)| seen.insert(name.clone()));
+        (kept, skipped)
+    }
+}
+
+/// GraphQL filter — skips items decorated with async-graphql attributes.
+struct GraphqlFilter;
+
+impl SymbolFilter for GraphqlFilter {
+    fn name(&self) -> &'static str {
+        "graphql"
+    }
+
+    fn label_color(&self) -> catppuccin::Color {
+        flavor().mauve
+    }
+
+    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(String, SkipReason)>) {
+        filter_graphql_exempt(symbols)
+    }
+}
+
+/// Builder filter — detects #[derive(Builder)] and adds {Name}Builder aliases.
+struct BuilderFilter;
+
+impl SymbolFilter for BuilderFilter {
+    fn name(&self) -> &'static str {
+        "builder"
+    }
+
+    fn label_color(&self) -> catppuccin::Color {
+        flavor().peach
+    }
+
+    fn aliases(&self, symbols: &[PubSymbol]) -> HashMap<String, String> {
+        detect_builder_aliases(symbols)
+    }
+}
+
+/// All available filters, in the order they run. Batteries included.
+fn all_filters() -> Vec<Box<dyn SymbolFilter>> {
+    vec![Box::new(OrmFilter), Box::new(GraphqlFilter), Box::new(BuilderFilter)]
+}
+
+/// Build the active filter list by removing any whose name is in `disabled`.
+fn active_filters(disabled: &[String]) -> Vec<Box<dyn SymbolFilter>> {
+    all_filters()
+        .into_iter()
+        .filter(|f| !disabled.iter().any(|d| d.eq_ignore_ascii_case(f.name())))
+        .collect()
+}
+
+/// Names of all known filters (for help text / validation).
+fn all_filter_names() -> Vec<&'static str> {
+    vec!["orm", "graphql", "builder"]
 }
 
 struct CrateResult {
@@ -485,10 +642,10 @@ const GRAPHQL_ATTRS: &[&str] = &[
     "Union",
 ];
 
-fn collect_pub_symbols(crate_path: &Path) -> Result<(Vec<PubSymbol>, Vec<(String, SkipReason)>)> {
+fn collect_pub_symbols(crate_path: &Path) -> Result<Vec<PubSymbol>> {
     let src = crate_path.join("src");
     if !src.is_dir() {
-        return Ok((vec![], vec![]));
+        return Ok(vec![]);
     }
 
     let pattern = r"^\s*pub\s+(?:async\s+)?(?:fn|struct|enum|trait|type|const|static)\s+([A-Za-z_][A-Za-z0-9_]*)";
@@ -501,7 +658,6 @@ fn collect_pub_symbols(crate_path: &Path) -> Result<(Vec<PubSymbol>, Vec<(String
             .unwrap();
 
     let mut results: Vec<PubSymbol> = vec![];
-    let mut orm_skipped: Vec<(String, SkipReason)> = vec![];
     let mut searcher = Searcher::new();
 
     for entry in WalkBuilder::new(&src)
@@ -544,15 +700,11 @@ fn collect_pub_symbols(crate_path: &Path) -> Result<(Vec<PubSymbol>, Vec<(String
                 if let Some(caps) = extract_re.captures(line) {
                     let name = caps[1].to_string();
                     if name.len() >= 2 {
-                        if SKIP_SYMBOLS.contains(&name.as_str()) {
-                            orm_skipped.push((name, SkipReason::Orm));
-                        } else {
-                            results.push(PubSymbol {
-                                name,
-                                file: path.to_path_buf(),
-                                line: line_num as usize,
-                            });
-                        }
+                        results.push(PubSymbol {
+                            name,
+                            file: path.to_path_buf(),
+                            line: line_num as usize,
+                        });
                     }
                 }
                 Ok(true)
@@ -561,20 +713,15 @@ fn collect_pub_symbols(crate_path: &Path) -> Result<(Vec<PubSymbol>, Vec<(String
     }
 
     // Deduplicate by name, keeping first occurrence
-    let all = results;
     let mut seen = HashSet::new();
     let mut deduped = vec![];
-    for sym in all {
+    for sym in results {
         if seen.insert(sym.name.clone()) {
             deduped.push(sym);
         }
     }
 
-    // Deduplicate ORM skipped too
-    let mut orm_seen = HashSet::new();
-    orm_skipped.retain(|(name, _)| orm_seen.insert(name.clone()));
-
-    Ok((deduped, orm_skipped))
+    Ok(deduped)
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +851,7 @@ fn analyze_crate(
     crate_path: &Path,
     all_crate_dirs: &[PathBuf],
     whitelist: &HashSet<(String, String)>,
+    filters: &[Box<dyn SymbolFilter>],
     on_progress: &dyn Fn(&str),
 ) -> Result<CrateResult> {
     let crate_name = crate_path
@@ -714,12 +862,18 @@ fn analyze_crate(
         .to_string();
 
     on_progress("collecting pub symbols…");
-    let (all_symbols, mut skipped) = collect_pub_symbols(crate_path)?;
+    let all_symbols = collect_pub_symbols(crate_path)?;
     let items_found = all_symbols.len();
 
-    on_progress("filtering graphql-exempt…");
-    let (symbols, graphql_skipped) = filter_graphql_exempt(all_symbols);
-    skipped.extend(graphql_skipped);
+    // Run each active filter plugin in sequence
+    let mut symbols = all_symbols;
+    let mut skipped: Vec<(String, SkipReason)> = vec![];
+    for filter in filters.iter() {
+        on_progress(&format!("filtering [{}]…", filter.name()));
+        let (kept, filter_skipped) = filter.filter(symbols);
+        symbols = kept;
+        skipped.extend(filter_skipped);
+    }
 
     if symbols.is_empty() {
         return Ok(CrateResult {
@@ -739,17 +893,20 @@ fn analyze_crate(
 
     let symbol_names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
 
-    // Detect #[derive(Builder)] → also search for {Name}Builder
-    let builder_aliases = detect_builder_aliases(&symbols);
+    // Collect aliases from all active plugins (e.g. Builder → {Name}Builder)
+    let mut all_aliases = HashMap::new();
+    for filter in filters.iter() {
+        all_aliases.extend(filter.aliases(&symbols));
+    }
     let mut ext_search: Vec<String> = symbol_names.clone();
-    for alias in builder_aliases.values() {
+    for alias in all_aliases.values() {
         ext_search.push(alias.clone());
     }
 
     on_progress(&format!("searching {} symbols externally…", ext_search.len()));
     let mut external_counts = count_symbol_hits(&ext_search, &external_dirs)?;
     // Merge alias hits back to the original symbol
-    for (origin, alias) in &builder_aliases {
+    for (origin, alias) in &all_aliases {
         if let Some(&count) = external_counts.get(alias) {
             *external_counts.entry(origin.clone()).or_insert(0) += count;
         }
@@ -764,13 +921,13 @@ fn analyze_crate(
     // Internal search for those symbols (including builder aliases)
     let mut internal_search: Vec<String> = no_external.iter().map(|s| s.name.clone()).collect();
     for sym in &no_external {
-        if let Some(alias) = builder_aliases.get(&sym.name) {
+        if let Some(alias) = all_aliases.get(&sym.name) {
             internal_search.push(alias.clone());
         }
     }
     on_progress(&format!("searching {} symbols internally…", internal_search.len()));
     let mut internal_counts = count_symbol_hits(&internal_search, &[crate_path.to_path_buf()])?;
-    for (origin, alias) in &builder_aliases {
+    for (origin, alias) in &all_aliases {
         if let Some(&count) = internal_counts.get(alias) {
             *internal_counts.entry(origin.clone()).or_insert(0) += count;
         }
@@ -806,7 +963,7 @@ fn analyze_crate(
         if let SymbolKind::CrateInternalOnly { .. } = item.kind {
             let mut search_names: Vec<&str> = vec![&item.symbol.name];
             let alias;
-            if let Some(a) = builder_aliases.get(&item.symbol.name) {
+            if let Some(a) = all_aliases.get(&item.symbol.name) {
                 alias = a.clone();
                 search_names.push(&alias);
             }
@@ -1853,13 +2010,22 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         .max()
         .unwrap_or(10);
 
-    let title = format!(
-        " 🔍 find-unused-pub — scanning ({}/{} crates, {:.1}s) [{}] ",
+    let mut title = format!(
+        " 🔍 find-unused-pub — scanning ({}/{} crates, {:.1}s) [{}]",
         done_count,
         total,
         elapsed.as_secs_f64(),
         palette_name(),
     );
+    let filters = active_filter_names();
+    if !filters.is_empty() {
+        title.push_str(&format!(" filters: {}", filters.join(",")));
+    }
+    let ignored = ignored_paths();
+    if !ignored.is_empty() {
+        title.push_str(&format!(" ignoring: {}", ignored.join(",")));
+    }
+    title.push(' ');
 
     let mut lines: Vec<Line> = vec![];
 
@@ -1947,13 +2113,22 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         SummaryView::Detail => "📋 detail",
         SummaryView::Skipped => "🛡️ skipped",
     };
-    let title = format!(
-        " 📦 find-unused-pub — {} crates in {:.1}s ({}) [{}] ",
+    let mut title = format!(
+        " 📦 find-unused-pub — {} crates in {:.1}s ({}) [{}]",
         app.results.len(),
         app.elapsed.as_secs_f64(),
         view_label,
         palette_name(),
     );
+    let filters = active_filter_names();
+    if !filters.is_empty() {
+        title.push_str(&format!(" filters: {}", filters.join(",")));
+    }
+    let ignored = ignored_paths();
+    if !ignored.is_empty() {
+        title.push_str(&format!(" ignoring: {}", ignored.join(",")));
+    }
+    title.push(' ');
 
     match app.summary_view {
         SummaryView::Table => draw_summary_table(frame, app, rows[0], &title, dim),
@@ -2270,7 +2445,7 @@ fn draw_summary_skipped(
             Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled("(graphql, orm, derive(Builder))", dim),
+        Span::styled(format!("({})", active_filter_names().join(", ")), dim),
     ]));
     lines.push(Line::from(Span::styled(
         "j/k: navigate crates, Space: expand/collapse",
@@ -2312,14 +2487,10 @@ fn draw_summary_skipped(
 
         if is_expanded {
             for (name, reason) in &result.skipped {
-                let reason_label = match reason {
-                    SkipReason::Graphql(attr) => Span::styled(format!(" [graphql:{attr}]"), Style::default().fg(ctp(flavor().mauve))),
-                    SkipReason::Orm => Span::styled(" [orm]", Style::default().fg(ctp(flavor().teal))),
-                };
                 lines.push(Line::from(vec![
                     Span::raw("      "),
                     Span::styled(name.as_str(), Style::default().fg(ctp(flavor().subtext0))),
-                    reason_label,
+                    Span::styled(reason.label(), Style::default().fg(reason.label_color())),
                 ]));
             }
         }
@@ -2617,6 +2788,28 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     FLAVOR.set(args.palette.flavor_colors()).expect("palette already set");
     PALETTE_NAME.set(args.palette.name()).expect("palette name already set");
+
+    // Validate --disable-filter values
+    let known = all_filter_names();
+    for name in &args.disable_filter {
+        if !known.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+            anyhow::bail!(
+                "unknown filter '{}'. Available filters: {}",
+                name,
+                known.join(", "),
+            );
+        }
+    }
+
+    // Build active filter list & store names for TUI
+    let filters = active_filters(&args.disable_filter);
+    let filter_names: Vec<&'static str> = filters.iter().map(|f| f.name()).collect();
+    ACTIVE_FILTER_NAMES.set(filter_names).expect("filter names already set");
+
+    // Store ignored paths for TUI display
+    let ignore_display: Vec<String> = args.ignore.iter().map(|p| p.display().to_string()).collect();
+    IGNORED_PATHS.set(ignore_display).expect("ignored paths already set");
+
     let start = Instant::now();
 
     // Find workspace root (look for root Cargo.toml with [workspace])
@@ -2639,7 +2832,7 @@ async fn main() -> Result<()> {
     let whitelist = load_whitelist(&conn)?;
 
     // Resolve crate paths
-    let target_crates: Vec<PathBuf> = if args.crate_paths.is_empty() {
+    let mut target_crates: Vec<PathBuf> = if args.crate_paths.is_empty() {
         let mut crates = vec![];
         for entry in fs::read_dir(&crates_dir)? {
             let entry = entry?;
@@ -2662,12 +2855,31 @@ async fn main() -> Result<()> {
             .collect()
     };
 
+    // Apply --ignore: remove crates whose path matches any ignore entry
+    if !args.ignore.is_empty() {
+        let ignore_abs: Vec<PathBuf> = args
+            .ignore
+            .iter()
+            .map(|ig| {
+                if ig.is_absolute() {
+                    ig.clone()
+                } else {
+                    workspace_root.join(ig)
+                }
+            })
+            .collect();
+        target_crates.retain(|p| !ignore_abs.iter().any(|ig| p == ig));
+    }
+
     // Build list of all crate dirs (includes src/, tests/, benches/ for searching)
     let all_crate_dirs: Vec<PathBuf> = fs::read_dir(&crates_dir)?
         .flatten()
         .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
         .map(|e| e.path())
         .collect();
+
+    // Wrap filters in Arc for sharing across spawn_blocking tasks
+    let filters: std::sync::Arc<Vec<Box<dyn SymbolFilter>>> = std::sync::Arc::new(filters);
 
     // Non-interactive batch fix: must await all results first
     if args.should_fix_crate_internal() || args.fix_unused {
@@ -2676,8 +2888,9 @@ async fn main() -> Result<()> {
             let crate_path = crate_path.clone();
             let all_dirs = all_crate_dirs.clone();
             let wl = whitelist.clone();
+            let f = filters.clone();
             handles.push(tokio::task::spawn_blocking(move || {
-                analyze_crate(&crate_path, &all_dirs, &wl, &|_| {})
+                analyze_crate(&crate_path, &all_dirs, &wl, &f, &|_| {})
             }));
         }
         let mut results = vec![];
@@ -2746,13 +2959,14 @@ async fn main() -> Result<()> {
         let all_dirs = all_crate_dirs.clone();
         let wl = whitelist.clone();
         let tx = scan_tx.clone();
+        let f = filters.clone();
         tokio::task::spawn_blocking(move || {
             let progress_tx = tx.clone();
             let progress_idx = idx;
             let on_progress = move |msg: &str| {
                 let _ = progress_tx.send((progress_idx, ScanMessage::Stage(msg.to_string())));
             };
-            let result = analyze_crate(&crate_path, &all_dirs, &wl, &on_progress)
+            let result = analyze_crate(&crate_path, &all_dirs, &wl, &f, &on_progress)
                 .unwrap_or_else(|_| {
                     CrateResult {
                         crate_name: crate_path
@@ -2922,7 +3136,7 @@ pub fn other() {}
                 "pub fn foo() {}\npub struct Bar {}\nfn private() {}\npub(crate) fn scoped() {}\n",
             )],
         )]);
-        let (symbols, _skipped) = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
+        let symbols = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"foo"));
         assert!(names.contains(&"Bar"));
@@ -2931,7 +3145,7 @@ pub fn other() {}
     }
 
     #[test]
-    fn collect_skips_orm_symbols() {
+    fn orm_filter_skips_orm_symbols() {
         let ws = create_workspace(&[(
             "alpha",
             &[(
@@ -2939,11 +3153,15 @@ pub fn other() {}
                 "pub struct Model {}\npub struct Entity {}\npub fn real_thing() {}\n",
             )],
         )]);
-        let (symbols, _skipped) = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
-        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(!names.contains(&"Model"));
-        assert!(!names.contains(&"Entity"));
-        assert!(names.contains(&"real_thing"));
+        let symbols = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
+        let filter = OrmFilter;
+        let (kept, skipped) = filter.filter(symbols);
+        let kept_names: Vec<&str> = kept.iter().map(|s| s.name.as_str()).collect();
+        assert!(!kept_names.contains(&"Model"));
+        assert!(!kept_names.contains(&"Entity"));
+        assert!(kept_names.contains(&"real_thing"));
+        assert!(skipped.iter().any(|(n, r)| n == "Model" && *r == SkipReason::Orm));
+        assert!(skipped.iter().any(|(n, r)| n == "Entity" && *r == SkipReason::Orm));
     }
 
     // -- count_symbol_hits ---------------------------------------------------
@@ -2989,7 +3207,7 @@ pub fn other() {}
         let crate_path = ws.path().join("crates/alpha");
         let src_dirs = crate_dirs(&ws);
         let whitelist = HashSet::new();
-        let result = analyze_crate(&crate_path, &src_dirs, &whitelist, &|_| {}).unwrap();
+        let result = analyze_crate(&crate_path, &src_dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
 
         let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
 
@@ -3016,7 +3234,7 @@ pub fn other() {}
         whitelist.insert(("whitelisted_fn".to_string(), "alpha".to_string()));
 
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
         assert!(result.unused.is_empty());
     }
 
@@ -3207,8 +3425,9 @@ impl MyMutation {
                 ),
             )],
         )]);
-        let (symbols, _skipped) = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
-        let (kept, skipped) = filter_graphql_exempt(symbols);
+        let symbols = collect_pub_symbols(&ws.path().join("crates/alpha")).unwrap();
+        let filter = GraphqlFilter;
+        let (kept, skipped) = filter.filter(symbols);
         let kept_names: Vec<&str> = kept.iter().map(|s| s.name.as_str()).collect();
         assert!(kept_names.contains(&"regular_fn"));
         assert!(!kept_names.contains(&"GqlOutput"));
@@ -3264,7 +3483,7 @@ pub struct Plain {
         let src_dirs = crate_dirs(&ws);
         let whitelist = HashSet::new();
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
 
         let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
         // MyConfig should not be unused because MyConfigBuilder is referenced externally
@@ -3288,7 +3507,7 @@ pub struct Plain {
         let src_dirs = crate_dirs(&ws);
         let whitelist = HashSet::new();
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &src_dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
 
         let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
         // MyConfig should be reported as unused since neither it nor MyConfigBuilder is used
@@ -3316,7 +3535,7 @@ pub struct Plain {
         let dirs = crate_dirs(&ws);
         let whitelist = HashSet::new();
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &whitelist, &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
 
         let find = |name: &str| result.unused.iter().find(|u| u.symbol.name == name);
         // test_helper is used in beta's tests/ → should NOT be reported
@@ -3338,7 +3557,7 @@ pub struct Plain {
         let dirs = crate_dirs(&ws);
         let whitelist = HashSet::new();
         let result =
-            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &whitelist, &|_| {}).unwrap();
+            analyze_crate(&ws.path().join("crates/alpha"), &dirs, &whitelist, &all_filters(), &|_| {}).unwrap();
 
         let item = result
             .unused
@@ -3348,5 +3567,73 @@ pub struct Plain {
         assert!(matches!(item.kind, SymbolKind::CrateInternalOnly { .. }));
         // Should have internal_refs (the non-definition usage sites)
         assert!(!item.internal_refs.is_empty());
+    }
+
+    // -- plugin system -------------------------------------------------------
+
+    #[test]
+    fn disable_filter_skips_graphql_exemption() {
+        // With graphql filter disabled, a #[derive(SimpleObject)] struct should
+        // be reported as unused (not skipped).
+        let ws = create_workspace(&[(
+            "alpha",
+            &[(
+                "lib.rs",
+                concat!(
+                    "#[derive(SimpleObject)]\n",
+                    "pub struct GqlOutput {\n",
+                    "    pub name: String,\n",
+                    "}\n",
+                ),
+            )],
+        )]);
+        let dirs = crate_dirs(&ws);
+        let whitelist = HashSet::new();
+        let no_graphql = active_filters(&["graphql".to_string()]);
+        let result = analyze_crate(
+            &ws.path().join("crates/alpha"),
+            &dirs,
+            &whitelist,
+            &no_graphql,
+            &|_| {},
+        )
+        .unwrap();
+        // GqlOutput should NOT be in skipped (graphql filter is off)
+        assert!(!result.skipped.iter().any(|(n, _)| n == "GqlOutput"));
+        // GqlOutput should be in unused
+        assert!(result.unused.iter().any(|u| u.symbol.name == "GqlOutput"));
+    }
+
+    #[test]
+    fn disable_filter_skips_orm_exemption() {
+        // With ORM filter disabled, Model/Entity should be reported as unused.
+        let ws = create_workspace(&[(
+            "alpha",
+            &[("lib.rs", "pub struct Model {}\npub struct Entity {}\n")],
+        )]);
+        let dirs = crate_dirs(&ws);
+        let whitelist = HashSet::new();
+        let no_orm = active_filters(&["orm".to_string()]);
+        let result = analyze_crate(
+            &ws.path().join("crates/alpha"),
+            &dirs,
+            &whitelist,
+            &no_orm,
+            &|_| {},
+        )
+        .unwrap();
+        assert!(!result.skipped.iter().any(|(n, _)| n == "Model"));
+        assert!(result.unused.iter().any(|u| u.symbol.name == "Model"));
+        assert!(result.unused.iter().any(|u| u.symbol.name == "Entity"));
+    }
+
+    #[test]
+    fn all_filter_names_matches_all_filters() {
+        let filters = all_filters();
+        let names = all_filter_names();
+        assert_eq!(filters.len(), names.len());
+        for (f, n) in filters.iter().zip(names.iter()) {
+            assert_eq!(f.name(), *n);
+        }
     }
 }
