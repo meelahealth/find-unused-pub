@@ -26,6 +26,7 @@ regex = "1"
 tokio = { version = "1.0", features = ["full"] }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
+wavegen = "0.4.1"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

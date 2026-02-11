@@ -322,55 +322,103 @@ fn eq_noise(seed: u32) -> f64 {
     (h & 0xFFFF) as f64 / 65536.0
 }
 
-/// Wave A: returns 0.0–1.0 for a given horizontal position and tick.
-/// Uses irrational-ratio spatial frequencies so the pattern never visibly repeats,
-/// plus a per-column phase shift for micro-variation across the width.
-fn eq_wave_a(x: f64, tick: u16) -> f64 {
+/// Sample N values from a wavegen waveform with tick-based phase evolution.
+/// Uses a mix of sine, sawtooth, and square components for rich visual texture.
+/// Each tick shifts all phases so the pattern evolves over time.
+fn eq_wave_samples(tick: u16, n: usize, channel: u8) -> Vec<f64> {
+    use wavegen::{Waveform, PeriodicFunction as PF};
+
     let tf = tick as f64;
-    let xi = x as u32;
     let ti = tick as u32;
-    // Per-column phase micro-shift: smooth, deterministic, breaks repetition.
-    let phase = eq_noise(xi.wrapping_mul(2017)) * std::f64::consts::TAU;
-    let beat = ((tf * 0.52).sin() * 0.5 + 0.5)
-        * ((tf * 1.3).sin() * 0.3 + 0.7);
-    // Spatial frequencies use irrational ratios (golden ratio, sqrt2, etc.)
-    // and are ~5x lower so cycles span the full terminal width.
-    let phi = 1.618033988;
-    let base = (x * 0.047 * phi + tf * 0.5 + phase).sin() * 0.2
-        + (x * 0.083 * std::f64::consts::SQRT_2 - tf * 0.35).sin() * 0.15
-        + (x * 0.131 + tf * 0.7).sin() * 0.12
-        + (x * 0.199 * phi - tf * 0.9).cos() * 0.08
-        + (x * 0.317 + tf * 1.2 + phase * 0.5).sin() * 0.06;
-    let jitter = (eq_noise(xi.wrapping_mul(31).wrapping_add(ti)) - 0.5) * 0.3;
-    let spike = if eq_noise(xi.wrapping_mul(17).wrapping_add(ti.wrapping_mul(7))) > 0.85 {
-        (eq_noise(xi.wrapping_add(ti)) - 0.5) * 0.5
-    } else {
-        0.0
+    let phi: f64 = 1.618033988;
+    let sqrt2 = std::f64::consts::SQRT_2;
+    let tau = std::f64::consts::TAU;
+
+    // ── Primary shape: original sine harmonics (restored from pre-wavegen) ──
+    let primary = |x: f64| -> f64 {
+        let xi = x as u32;
+        let phase_seed = if channel == 0 { xi.wrapping_mul(2017) } else { xi.wrapping_mul(3011) };
+        let phase = eq_noise(phase_seed) * tau;
+        if channel == 0 {
+            (x * 0.047 * phi + tf * 0.5 + phase).sin() * 0.2
+                + (x * 0.083 * sqrt2 - tf * 0.35).sin() * 0.15
+                + (x * 0.131 + tf * 0.7).sin() * 0.12
+                + (x * 0.199 * phi - tf * 0.9).cos() * 0.08
+                + (x * 0.317 + tf * 1.2 + phase * 0.5).sin() * 0.06
+        } else {
+            (x * 0.041 - tf * 0.4 + phase).cos() * 0.18
+                + (x * 0.071 * phi + tf * 0.55).sin() * 0.16
+                + (x * 0.113 * sqrt2 - tf * 0.8).sin() * 0.1
+                + (x * 0.173 + tf * 0.6 + phase * 0.7).cos() * 0.09
+                + (x * 0.281 * phi - tf * 1.0).sin() * 0.07
+        }
     };
-    (0.5 + (base + jitter + spike) * beat).clamp(0.0, 1.0)
+
+    // ── Wavegen texture: sawtooth + square for subtle grit (disabled) ──
+    let sr = 1000.0;
+    let (wp1, wp2, wp3) = if channel == 0 {
+        (tf * 0.019, tf * 0.041, tf * 0.067)
+    } else {
+        (tf * 0.023, tf * 0.047, tf * 0.059)
+    };
+    let texture: Waveform<f64, f64> = if channel == 0 {
+        Waveform::with_components(sr, vec![
+            PF::sawtooth(2.3, 0.06, wp1),
+            PF::square(0.7 * phi, 0.04, wp2),
+            PF::sawtooth(5.9 * sqrt2, 0.03, wp3),
+        ])
+    } else {
+        Waveform::with_components(sr, vec![
+            PF::square(1.9, 0.05, wp1),
+            PF::sawtooth(3.1 * phi, 0.04, wp2),
+            PF::square(6.7, 0.03, wp3),
+        ])
+    };
+
+    // Beat envelope — original speeds.
+    let beat = if channel == 0 {
+        ((tf * 0.52).sin() * 0.5 + 0.5) * ((tf * 1.3).sin() * 0.3 + 0.7)
+    } else {
+        ((tf * 0.37).sin() * 0.5 + 0.5) * ((tf * 1.1).cos() * 0.35 + 0.65)
+    };
+
+    // Texture gate: mostly closed, swells open briefly ~every few seconds.
+    // Uses a sharp power curve so it spends most time near zero.
+    let gate_raw = ((tf * 0.31).sin() * 0.5 + 0.5) * ((tf * 0.17).cos() * 0.5 + 0.5);
+    let tex_gate = gate_raw * gate_raw * gate_raw; // cubic: near 0 most of the time
+
+    let tex: Vec<f64> = texture.iter().take(n).collect();
+    (0..n)
+        .map(|i| {
+            let x = i as f64;
+            let xi = i as u32;
+            let wave = primary(x) + tex[i] * tex_gate;
+            let jitter = (eq_noise(xi.wrapping_mul(31).wrapping_add(ti)) - 0.5) * 0.3;
+            let spike = if eq_noise(xi.wrapping_mul(17).wrapping_add(ti.wrapping_mul(7 + channel as u32))) > 0.85 {
+                (eq_noise(xi.wrapping_add(ti)) - 0.5) * 0.5
+            } else {
+                0.0
+            };
+            (0.5 + (wave + jitter + spike) * beat).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// Wave A: returns 0.0–1.0 for a given horizontal position and tick.
+fn eq_wave_a(x: f64, tick: u16) -> f64 {
+    // For single-sample access (Ferris), generate a small batch and pick.
+    let idx = x.round().clamp(0.0, 9999.0) as usize;
+    let n = idx + 1;
+    let samples = eq_wave_samples(tick, n, 0);
+    samples[idx]
 }
 
 /// Wave B: returns 0.0–1.0 for a given horizontal position and tick.
 fn eq_wave_b(x: f64, tick: u16) -> f64 {
-    let tf = tick as f64;
-    let xi = x as u32;
-    let ti = tick as u32;
-    let phase = eq_noise(xi.wrapping_mul(3011)) * std::f64::consts::TAU;
-    let beat = ((tf * 0.37).sin() * 0.5 + 0.5)
-        * ((tf * 1.1).cos() * 0.35 + 0.65);
-    let phi = 1.618033988;
-    let base = (x * 0.041 - tf * 0.4 + phase).cos() * 0.18
-        + (x * 0.071 * phi + tf * 0.55).sin() * 0.16
-        + (x * 0.113 * std::f64::consts::SQRT_2 - tf * 0.8).sin() * 0.1
-        + (x * 0.173 + tf * 0.6 + phase * 0.7).cos() * 0.09
-        + (x * 0.281 * phi - tf * 1.0).sin() * 0.07;
-    let jitter = (eq_noise(xi.wrapping_mul(47).wrapping_add(ti.wrapping_mul(3))) - 0.5) * 0.25;
-    let spike = if eq_noise(xi.wrapping_mul(23).wrapping_add(ti.wrapping_mul(11))) > 0.87 {
-        (eq_noise(xi.wrapping_mul(7).wrapping_add(ti)) - 0.5) * 0.45
-    } else {
-        0.0
-    };
-    (0.5 + (base + jitter + spike) * beat).clamp(0.0, 1.0)
+    let idx = x.round().clamp(0.0, 9999.0) as usize;
+    let n = idx + 1;
+    let samples = eq_wave_samples(tick, n, 1);
+    samples[idx]
 }
 
 /// Multi-row dual-wave braille visualizer (oscilloscope style).
@@ -389,19 +437,12 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
         (v * max_row as f64).round().clamp(0.0, max_row as f64) as usize
     };
 
-    // Pre-compute both waves (2 horizontal samples per cell column).
-    let samples_a: Vec<usize> = (0..width)
-        .flat_map(|col| {
-            let x = (col as f64) * 2.0;
-            [to_row(eq_wave_a(x, tick)), to_row(eq_wave_a(x + 1.0, tick))]
-        })
-        .collect();
-    let samples_b: Vec<usize> = (0..width)
-        .flat_map(|col| {
-            let x = (col as f64) * 2.0;
-            [to_row(eq_wave_b(x, tick)), to_row(eq_wave_b(x + 1.0, tick))]
-        })
-        .collect();
+    // Pre-compute both waves in batch (2 horizontal samples per cell column).
+    let n = (width as usize) * 2;
+    let raw_a = eq_wave_samples(tick, n, 0);
+    let raw_b = eq_wave_samples(tick, n, 1);
+    let samples_a: Vec<usize> = raw_a.iter().map(|&v| to_row(v)).collect();
+    let samples_b: Vec<usize> = raw_b.iter().map(|&v| to_row(v)).collect();
 
     let (color_a, color_b, color_both) = eq_colors();
 

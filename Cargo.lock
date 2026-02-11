@@ -445,6 +445,7 @@ dependencies = [
  "tokio",
  "tree-sitter",
  "tree-sitter-rust",
+ "wavegen",
 ]
 
 [[package]]
@@ -1411,6 +1412,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "wavegen"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2913201c3194677183e058a7ddb1a237a19e4e6b97275d9fe431c41a247f449c"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
