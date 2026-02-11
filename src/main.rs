@@ -270,6 +270,67 @@ fn theme() -> &'static ThemeColors {
     &themes[idx.min(themes.len() - 1)]
 }
 
+/// Braille waveform visualizer for the summary bottom border.
+/// Chaotic oscilloscope-style line with harmonics, noise, and beat-driven amplitude.
+fn eq_visualizer<'a>(tick: u16, width: u16) -> Line<'a> {
+    const DOT: [[u32; 2]; 4] = [
+        [0x01, 0x08], // row 0 (top)
+        [0x02, 0x10], // row 1
+        [0x04, 0x20], // row 2
+        [0x40, 0x80], // row 3 (bottom)
+    ];
+
+    let t = theme();
+    let tf = tick as f64;
+
+    // Cheap deterministic noise via Knuth multiplicative hash.
+    let noise = |seed: u32| -> f64 {
+        let h = seed.wrapping_mul(2654435761);
+        let h = h ^ (h >> 16);
+        (h & 0xFFFF) as f64 / 65536.0
+    };
+
+    // Beat envelope — amplitude pulses like music (~128 BPM at 100ms ticks)
+    let beat = ((tf * 0.52).sin() * 0.5 + 0.5)
+        * ((tf * 1.3).sin() * 0.3 + 0.7);
+
+    let wave = |x: f64| -> f64 {
+        let xi = x as u32;
+        let ti = tick as u32;
+        // Harmonics at different frequencies
+        let base = (x * 0.3 + tf * 0.5).sin() * 0.2
+            + (x * 0.8 - tf * 0.35).sin() * 0.15
+            + (x * 1.7 + tf * 0.7).sin() * 0.12
+            + (x * 3.1 - tf * 0.9).cos() * 0.08
+            + (x * 5.0 + tf * 1.2).sin() * 0.06;
+        // High-frequency jitter (changes each tick per column)
+        let jitter = (noise(xi.wrapping_mul(31).wrapping_add(ti)) - 0.5) * 0.3;
+        // Occasional sharp spikes
+        let spike = if noise(xi.wrapping_mul(17).wrapping_add(ti.wrapping_mul(7))) > 0.85 {
+            (noise(xi.wrapping_add(ti)) - 0.5) * 0.5
+        } else {
+            0.0
+        };
+        (0.5 + (base + jitter + spike) * beat).clamp(0.0, 1.0)
+    };
+
+    let spans: Vec<Span<'a>> = (0..width)
+        .map(|col| {
+            let x_left = (col as f64) * 2.0;
+            let x_right = x_left + 1.0;
+
+            let row_left = (wave(x_left) * 3.0).round().clamp(0.0, 3.0) as usize;
+            let row_right = (wave(x_right) * 3.0).round().clamp(0.0, 3.0) as usize;
+
+            let bits = 0x2800u32 | DOT[row_left][0] | DOT[row_right][1];
+            let ch = char::from_u32(bits).unwrap_or(' ');
+
+            Span::styled(String::from(ch), Style::default().fg(t.tertiary))
+        })
+        .collect();
+    Line::from(spans)
+}
+
 /// Build a palette swatch line: colored blocks for each theme color + name.
 fn palette_swatch<'a>() -> Line<'a> {
     let t = theme();
@@ -2889,6 +2950,7 @@ fn draw_summary_table(
     }
     table_lines.push(Line::from(total_spans));
 
+    let eq_width = area.width.saturating_sub(2);
     let table_widget = Paragraph::new(Text::from(table_lines))
         .scroll((app.detail_scroll, 0))
         .block(
@@ -2896,7 +2958,8 @@ fn draw_summary_table(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme().outline))
                 .title(title.to_string())
-                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD))
+                .title_bottom(eq_visualizer(app.crab_tick, eq_width)),
         );
     frame.render_widget(table_widget, area);
 }
@@ -3028,6 +3091,7 @@ fn draw_summary_detail(
         lines.push(Line::from(Span::styled("No issues found.", dim)));
     }
 
+    let eq_width = area.width.saturating_sub(2);
     let detail_widget = Paragraph::new(Text::from(lines))
         .scroll((app.detail_scroll, 0))
         .block(
@@ -3035,7 +3099,8 @@ fn draw_summary_detail(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme().outline))
                 .title(title.to_string())
-                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD))
+                .title_bottom(eq_visualizer(app.crab_tick, eq_width)),
         );
     frame.render_widget(detail_widget, area);
 }
@@ -3122,6 +3187,7 @@ fn draw_summary_skipped(
         lines.push(Line::from(Span::styled("No symbols were skipped.", dim)));
     }
 
+    let eq_width = area.width.saturating_sub(2);
     let widget = Paragraph::new(Text::from(lines))
         .scroll((app.detail_scroll, 0))
         .block(
@@ -3129,7 +3195,8 @@ fn draw_summary_skipped(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme().outline))
                 .title(title.to_string())
-                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD))
+                .title_bottom(eq_visualizer(app.crab_tick, eq_width)),
         );
     frame.render_widget(widget, area);
 }
