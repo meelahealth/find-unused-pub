@@ -35,6 +35,7 @@ use rusqlite::Connection;
 static PALETTE_IDX: AtomicU8 = AtomicU8::new(3);
 static ACTIVE_FILTER_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
 static DISABLED_FILTER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
+static ENABLED_FILTER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 static IGNORED_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Get the active catppuccin flavor (resolved live from PALETTE_IDX).
@@ -62,6 +63,11 @@ fn active_filter_names() -> &'static [&'static str] {
 /// Get the list of disabled filter names for TUI display.
 fn disabled_filter_names() -> &'static [String] {
     DISABLED_FILTER_NAMES.get().map_or(&[], |v| v.as_slice())
+}
+
+/// Get the list of explicitly enabled opt-in filter names for TUI display.
+fn enabled_filter_names() -> &'static [String] {
+    ENABLED_FILTER_NAMES.get().map_or(&[], |v| v.as_slice())
 }
 
 /// Get the list of ignored paths for TUI display.
@@ -172,6 +178,10 @@ struct Args {
     /// Disable a filter plugin by name (repeatable, e.g. --disable-filter graphql)
     #[arg(long, env = "FIND_UNUSED_PUB_DISABLE_FILTER", value_delimiter = ',')]
     disable_filter: Vec<String>,
+
+    /// Enable an opt-in filter plugin by name (repeatable, e.g. --enable-filter cynic)
+    #[arg(long, env = "FIND_UNUSED_PUB_ENABLE_FILTER", value_delimiter = ',')]
+    enable_filter: Vec<String>,
 }
 
 impl Args {
@@ -213,6 +223,7 @@ struct UnusedSymbol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkipReason {
     Graphql(&'static str),
+    Cynic(&'static str),
     Orm,
 }
 
@@ -221,6 +232,7 @@ impl SkipReason {
     fn label(&self) -> String {
         match self {
             SkipReason::Graphql(attr) => format!(" [graphql:{attr}]"),
+            SkipReason::Cynic(attr) => format!(" [cynic:{attr}]"),
             SkipReason::Orm => " [orm]".to_string(),
         }
     }
@@ -229,6 +241,7 @@ impl SkipReason {
     fn label_color(&self) -> Color {
         let filter_name = match self {
             SkipReason::Graphql(_) => "graphql",
+            SkipReason::Cynic(_) => "cynic",
             SkipReason::Orm => "orm",
         };
         // Find the matching filter to get its configured color
@@ -256,6 +269,12 @@ trait SymbolFilter: Send + Sync {
 
     /// Catppuccin color used for the `[name]` label in the TUI.
     fn label_color(&self) -> catppuccin::Color;
+
+    /// Whether this filter is enabled by default.
+    /// Opt-in filters (like cynic) return `false` here.
+    fn default_enabled(&self) -> bool {
+        true
+    }
 
     /// Partition `symbols` into (kept, skipped).
     /// Called once per crate after `collect_pub_symbols`.
@@ -335,22 +354,57 @@ impl SymbolFilter for BuilderFilter {
     }
 }
 
-/// All available filters, in the order they run. Batteries included.
-fn all_filters() -> Vec<Box<dyn SymbolFilter>> {
-    vec![Box::new(OrmFilter), Box::new(GraphqlFilter), Box::new(BuilderFilter)]
+/// Cynic filter — skips items decorated with cynic derive attributes.
+/// Off by default — enable with `--enable-filter cynic`.
+struct CynicFilter;
+
+impl SymbolFilter for CynicFilter {
+    fn name(&self) -> &'static str {
+        "cynic"
+    }
+
+    fn label_color(&self) -> catppuccin::Color {
+        flavor().sky
+    }
+
+    fn default_enabled(&self) -> bool {
+        false
+    }
+
+    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(PubSymbol, SkipReason)>) {
+        filter_cynic_exempt(symbols)
+    }
 }
 
-/// Build the active filter list by removing any whose name is in `disabled`.
-fn active_filters(disabled: &[String]) -> Vec<Box<dyn SymbolFilter>> {
+/// All available filters, in the order they run.
+fn all_filters() -> Vec<Box<dyn SymbolFilter>> {
+    vec![
+        Box::new(OrmFilter),
+        Box::new(GraphqlFilter),
+        Box::new(BuilderFilter),
+        Box::new(CynicFilter),
+    ]
+}
+
+/// Build the active filter list: default-on filters minus `disabled`, plus
+/// default-off filters that appear in `enabled`.
+fn active_filters(disabled: &[String], enabled: &[String]) -> Vec<Box<dyn SymbolFilter>> {
     all_filters()
         .into_iter()
-        .filter(|f| !disabled.iter().any(|d| d.eq_ignore_ascii_case(f.name())))
+        .filter(|f| {
+            let explicitly_disabled = disabled.iter().any(|d| d.eq_ignore_ascii_case(f.name()));
+            let explicitly_enabled = enabled.iter().any(|e| e.eq_ignore_ascii_case(f.name()));
+            if explicitly_disabled {
+                return false;
+            }
+            f.default_enabled() || explicitly_enabled
+        })
         .collect()
 }
 
 /// Names of all known filters (for help text / validation).
 fn all_filter_names() -> Vec<&'static str> {
-    vec!["orm", "graphql", "builder"]
+    vec!["orm", "graphql", "builder", "cynic"]
 }
 
 struct CrateResult {
@@ -1287,6 +1341,87 @@ fn filter_graphql_exempt(symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(PubSy
 }
 
 // ---------------------------------------------------------------------------
+// cynic attribute detection
+// ---------------------------------------------------------------------------
+
+/// cynic derive macro names that mark items as framework-used.
+const CYNIC_ATTRS: &[&str] = &[
+    "QueryFragment",
+    "QueryVariables",
+    "InputObject",
+    "Enum",
+    "Scalar",
+    "InlineFragments",
+];
+
+/// Check if a symbol at `line` (0-indexed) has a cynic derive attribute.
+fn is_cynic_exempt(source: &str, line: usize) -> Option<&'static str> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
+        return None;
+    }
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return None,
+    };
+    let root = tree.root_node();
+
+    let item = match find_item_at_line(root, line) {
+        Some(i) => i,
+        None => return None,
+    };
+
+    node_has_cynic_attr(item, source)
+}
+
+/// Check if a node's preceding sibling attributes contain any CYNIC_ATTRS.
+fn node_has_cynic_attr(node: tree_sitter::Node, source: &str) -> Option<&'static str> {
+    let mut sibling = node.prev_sibling();
+    while let Some(s) = sibling {
+        match s.kind() {
+            "attribute_item" => {
+                let text = &source[s.start_byte()..s.end_byte()];
+                if text.contains("cynic") {
+                    for attr in CYNIC_ATTRS {
+                        if text.contains(attr) {
+                            return Some(attr);
+                        }
+                    }
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        sibling = s.prev_sibling();
+    }
+    None
+}
+
+/// Filter out symbols that are exempt due to cynic derive attributes.
+fn filter_cynic_exempt(symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(PubSymbol, SkipReason)>) {
+    let mut kept = vec![];
+    let mut skipped = vec![];
+    for sym in symbols {
+        let source = match fs::read_to_string(&sym.file) {
+            Ok(s) => s,
+            Err(_) => {
+                kept.push(sym);
+                continue;
+            }
+        };
+        if let Some(attr) = is_cynic_exempt(&source, sym.line - 1) {
+            skipped.push((sym, SkipReason::Cynic(attr)));
+        } else {
+            kept.push(sym);
+        }
+    }
+    (kept, skipped)
+}
+
+// ---------------------------------------------------------------------------
 // derive_builder alias detection (tree-sitter)
 // ---------------------------------------------------------------------------
 
@@ -2054,13 +2189,15 @@ fn config_status_lines(dim: Style) -> Vec<Line<'static>> {
 
     let filters = active_filter_names();
     let disabled = disabled_filter_names();
+    let enabled = enabled_filter_names();
     let ignored = ignored_paths();
 
     // Only show config block if there's something non-default to report
     let has_disabled = !disabled.is_empty();
+    let has_enabled = !enabled.is_empty();
     let has_ignored = !ignored.is_empty();
 
-    if has_disabled || has_ignored {
+    if has_disabled || has_enabled || has_ignored {
         let mut spans: Vec<Span> = vec![
             Span::styled("  config ", Style::default().fg(ctp(flavor().subtext0)).add_modifier(Modifier::BOLD)),
         ];
@@ -2082,6 +2219,15 @@ fn config_status_lines(dim: Style) -> Vec<Line<'static>> {
             spans.push(Span::styled(
                 disabled.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
                 Style::default().fg(ctp(flavor().red)),
+            ));
+        }
+
+        // Enabled opt-in filters (only show if any)
+        if has_enabled {
+            spans.push(Span::styled("  opt-in: ", dim));
+            spans.push(Span::styled(
+                enabled.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                Style::default().fg(ctp(flavor().sky)),
             ));
         }
 
@@ -2887,9 +3033,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     PALETTE_IDX.store(args.palette.to_index(), Ordering::Relaxed);
 
-    // Validate --disable-filter values
+    // Validate --disable-filter and --enable-filter values
     let known = all_filter_names();
-    for name in &args.disable_filter {
+    for name in args.disable_filter.iter().chain(args.enable_filter.iter()) {
         if !known.iter().any(|k| k.eq_ignore_ascii_case(name)) {
             anyhow::bail!(
                 "unknown filter '{}'. Available filters: {}",
@@ -2900,12 +3046,15 @@ async fn main() -> Result<()> {
     }
 
     // Build active filter list & store names for TUI
-    let filters = active_filters(&args.disable_filter);
+    let filters = active_filters(&args.disable_filter, &args.enable_filter);
     let filter_names: Vec<&'static str> = filters.iter().map(|f| f.name()).collect();
     ACTIVE_FILTER_NAMES.set(filter_names).expect("filter names already set");
     DISABLED_FILTER_NAMES
         .set(args.disable_filter.clone())
         .expect("disabled filter names already set");
+    ENABLED_FILTER_NAMES
+        .set(args.enable_filter.clone())
+        .expect("enabled filter names already set");
 
     // Store ignored paths for TUI display
     let ignore_display: Vec<String> = args.ignore.iter().map(|p| p.display().to_string()).collect();
@@ -3740,7 +3889,7 @@ pub struct Plain {
         )]);
         let dirs = crate_dirs(&ws);
         let whitelist = HashSet::new();
-        let no_graphql = active_filters(&["graphql".to_string()]);
+        let no_graphql = active_filters(&["graphql".to_string()], &[]);
         let result = analyze_crate(
             &ws.path().join("crates/alpha"),
             &dirs,
@@ -3764,7 +3913,7 @@ pub struct Plain {
         )]);
         let dirs = crate_dirs(&ws);
         let whitelist = HashSet::new();
-        let no_orm = active_filters(&["orm".to_string()]);
+        let no_orm = active_filters(&["orm".to_string()], &[]);
         let result = analyze_crate(
             &ws.path().join("crates/alpha"),
             &dirs,
