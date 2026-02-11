@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -128,7 +127,7 @@ fn collect_pub_symbols(crate_path: &Path) -> Result<Vec<PubSymbol>> {
         regex::Regex::new(r"^\s*pub\s+(?:async\s+)?(?:fn|struct|enum|trait|type|const|static)\s+([A-Za-z_][A-Za-z0-9_]*)")
             .unwrap();
 
-    let results: Mutex<Vec<PubSymbol>> = Mutex::new(vec![]);
+    let mut results: Vec<PubSymbol> = vec![];
     let mut searcher = Searcher::new();
 
     for entry in WalkBuilder::new(&src)
@@ -171,7 +170,7 @@ fn collect_pub_symbols(crate_path: &Path) -> Result<Vec<PubSymbol>> {
                 if let Some(caps) = extract_re.captures(line) {
                     let name = caps[1].to_string();
                     if name.len() >= 2 && !SKIP_SYMBOLS.contains(&name.as_str()) {
-                        results.lock().unwrap().push(PubSymbol {
+                        results.push(PubSymbol {
                             name,
                             file: path.to_path_buf(),
                             line: line_num as usize,
@@ -184,7 +183,7 @@ fn collect_pub_symbols(crate_path: &Path) -> Result<Vec<PubSymbol>> {
     }
 
     // Deduplicate by name, keeping first occurrence
-    let all = results.into_inner().unwrap();
+    let all = results;
     let mut seen = HashSet::new();
     let mut deduped = vec![];
     for sym in all {
@@ -219,7 +218,7 @@ fn count_symbol_hits(
         .context("building symbol search regex")?;
 
     let word_re = regex::Regex::new(&pattern).unwrap();
-    let counts: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
+    let mut counts: HashMap<String, usize> = HashMap::new();
 
     let mut walker = WalkBuilder::new(&search_dirs[0]);
     for dir in &search_dirs[1..] {
@@ -249,14 +248,14 @@ fn count_symbol_hits(
             UTF8(|_line_num, line| {
                 for m in word_re.find_iter(line) {
                     let sym = m.as_str().to_string();
-                    *counts.lock().unwrap().entry(sym).or_insert(0) += 1;
+                    *counts.entry(sym).or_insert(0) += 1;
                 }
                 Ok(true)
             }),
         )?;
     }
 
-    Ok(counts.into_inner().unwrap())
+    Ok(counts)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +275,7 @@ fn analyze_crate(
         .to_string();
     let crate_src = crate_path.join("src");
 
-    eprint!(
+    eprintln!(
         "  {} {}...",
         "scanning".dimmed(),
         crate_name.cyan(),
