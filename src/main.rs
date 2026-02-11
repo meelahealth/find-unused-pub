@@ -2448,11 +2448,10 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         .unwrap_or(10);
 
     let title = format!(
-        " 🔍 find-unused-pub — scanning ({}/{} crates, {:.1}s) [{}] ",
+        " 🔍 find-unused-pub — scanning ({}/{} crates, {:.1}s) ",
         done_count,
         total,
         elapsed.as_secs_f64(),
-        theme().name,
     );
 
     let mut lines: Vec<Line> = vec![];
@@ -2566,11 +2565,10 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
     };
     let cache_hint = if app.from_cache { " (cached — run with --no-cache to rescan)" } else { "" };
     let title = format!(
-        " 📦 find-unused-pub — {} crates in {:.1}s ({}) [{}]{} ",
+        " 📦 find-unused-pub — {} crates in {:.1}s ({}){} ",
         app.results.len(),
         app.elapsed.as_secs_f64(),
         view_label,
-        theme().name,
         cache_hint,
     );
 
