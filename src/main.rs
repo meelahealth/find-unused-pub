@@ -20,7 +20,7 @@ use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use ignore::WalkBuilder;
 use owo_colors::OwoColorize;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
@@ -167,7 +167,7 @@ fn palette_swatch<'a>() -> Line<'a> {
         format!(" {} ", t.name),
         Style::default().fg(t.on_surface_variant),
     ));
-    Line::from(spans)
+    Line::from(spans).alignment(Alignment::Right)
 }
 
 /// Cycle to the next palette and return its name.
@@ -3043,7 +3043,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
     let mut patch_title = String::from(" Patch ");
     if let GitLoadState::Done(info) = &app.git_states[app.current] {
         if let Some(entry) = &info.log_entry {
-            patch_title = format!(" 📄 Patch from {} (j/k to scroll) ", entry.short_hash);
+            patch_title = format!(" 📄 $ git show {} ", entry.short_hash);
             // Show grep-like matches first
             if !entry.diff_matches.is_empty() {
                 patch_lines.push(Line::from(Span::styled(
