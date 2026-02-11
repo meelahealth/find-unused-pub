@@ -48,6 +48,24 @@ fn palette_name() -> &'static str {
     Palette::from_index(PALETTE_IDX.load(Ordering::Relaxed)).name()
 }
 
+/// Build a palette swatch line: colored █ blocks for each accent color + name.
+fn palette_swatch<'a>() -> Line<'a> {
+    let f = flavor();
+    let accents = [
+        f.rosewater, f.flamingo, f.pink, f.mauve, f.red, f.maroon, f.peach,
+        f.yellow, f.green, f.teal, f.sky, f.sapphire, f.blue, f.lavender,
+    ];
+    let mut spans: Vec<Span<'a>> = vec![Span::raw(" ")];
+    for c in accents {
+        spans.push(Span::styled("█", Style::default().fg(ctp(c))));
+    }
+    spans.push(Span::styled(
+        format!(" {} ", palette_name()),
+        Style::default().fg(ctp(f.subtext0)),
+    ));
+    Line::from(spans)
+}
+
 /// Cycle to the next palette and return its name.
 fn cycle_palette() -> &'static str {
     let next = (PALETTE_IDX.load(Ordering::Relaxed) + 1) % 4;
@@ -2324,6 +2342,12 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         }
     }
 
+    let rows = Layout::vertical([
+        Constraint::Min(5),    // content
+        Constraint::Length(3), // actions bar
+    ])
+    .split(frame.area());
+
     let widget = Paragraph::new(Text::from(lines))
         .scroll((app.detail_scroll, 0))
         .block(
@@ -2333,7 +2357,23 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
                 .title(title)
                 .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
         );
-    frame.render_widget(widget, frame.area());
+    frame.render_widget(widget, rows[0]);
+
+    let bar = Paragraph::new(Line::from(vec![
+        Span::styled(" p", Style::default().fg(ctp(flavor().peach)).add_modifier(Modifier::BOLD)),
+        Span::styled(": palette  ", dim),
+        Span::styled("PgUp/PgDn", Style::default().fg(ctp(flavor().peach)).add_modifier(Modifier::BOLD)),
+        Span::styled(": scroll  ", dim),
+        Span::styled("q", Style::default().fg(ctp(flavor().peach)).add_modifier(Modifier::BOLD)),
+        Span::styled(": quit", dim),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ctp(flavor().surface2)))
+            .title_bottom(palette_swatch()),
+    );
+    frame.render_widget(bar, rows[1]);
 }
 
 fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
@@ -2395,7 +2435,8 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, PgUp/PgDn: scroll, p: palette, q: quit) ")
-                .title_style(Style::default().fg(ctp(flavor().peach))),
+                .title_style(Style::default().fg(ctp(flavor().peach)))
+                .title_bottom(palette_swatch()),
         )
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(menu_widget, rows[1], &mut list_state);
@@ -3014,7 +3055,8 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(" ⚡ Action (f/a/s or ↑↓+Enter, j/k scroll, q quit) ")
-                .title_style(Style::default().fg(ctp(flavor().peach))),
+                .title_style(Style::default().fg(ctp(flavor().peach)))
+                .title_bottom(palette_swatch()),
         )
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(action_list, rows[1], &mut list_state);
