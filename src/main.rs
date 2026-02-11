@@ -284,6 +284,28 @@ fn palette_swatch<'a>() -> Line<'a> {
     Line::from(spans).alignment(Alignment::Right)
 }
 
+/// Build a right-aligned Ferris animation line for the top border.
+fn ferris_line<'a>(tick: u16) -> Line<'a> {
+    const TRACK: usize = 20;
+
+    let t = theme();
+    let dot_style = Style::default().fg(t.outline);
+    let crab_style = Style::default().fg(t.tertiary);
+
+    let cycle = (TRACK * 2) as u16;
+    let pos = (tick % cycle) as usize;
+    let pos = if pos < TRACK { pos } else { TRACK * 2 - pos };
+
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled("·".repeat(pos), dot_style),
+        Span::styled("🦀", crab_style),
+        Span::styled("·".repeat(TRACK - pos), dot_style),
+        Span::raw(" "),
+    ])
+    .alignment(Alignment::Right)
+}
+
 /// Cycle to the next palette and return its name.
 fn cycle_palette() -> &'static str {
     let next = (PALETTE_IDX.load(Ordering::Relaxed) + 1) % PALETTE_COUNT;
@@ -1941,6 +1963,8 @@ struct App {
     skipped_cursor: usize,
     /// True if any results came from the scan cache.
     from_cache: bool,
+    /// Animation tick for the Ferris crab during scanning.
+    crab_tick: u16,
 }
 
 struct ReviewApp {
@@ -2037,6 +2061,7 @@ fn run_tui(
         skipped_expanded: HashSet::new(),
         skipped_cursor: 0,
         from_cache,
+        crab_tick: 0,
     };
 
     // Enter alternate screen
@@ -2072,6 +2097,7 @@ fn run_tui_main_loop(
     app: &mut App,
 ) -> Result<()> {
     loop {
+        app.crab_tick = app.crab_tick.wrapping_add(1);
         match app.phase {
             TuiPhase::Scanning => {
                 // Drain messages from the scan channel
@@ -2291,7 +2317,8 @@ fn run_tui_main_loop(
                         review.git_states[idx] = state;
                     }
 
-                    terminal.draw(|frame| draw_review(frame, review))?;
+                    let tick = app.crab_tick;
+                    terminal.draw(|frame| draw_review(frame, review, tick))?;
 
                     if event::poll(Duration::from_millis(100))? {
                         if let Event::Key(key) = event::read()? {
@@ -2680,6 +2707,7 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme().outline))
+            .title(ferris_line(app.crab_tick))
             .title_bottom(palette_swatch()),
     );
     frame.render_widget(bar, rows[1]);
@@ -2746,6 +2774,7 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
                 .border_style(Style::default().fg(theme().outline))
                 .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, PgUp/PgDn: scroll, p: palette, q: quit) ")
                 .title_style(Style::default().fg(theme().tertiary))
+                .title(ferris_line(app.crab_tick))
                 .title_bottom(palette_swatch()),
         )
         .highlight_symbol("▸ ");
@@ -3105,7 +3134,7 @@ fn draw_summary_skipped(
     frame.render_widget(widget, area);
 }
 
-fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
+fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp, crab_tick: u16) {
     let item = &app.items[app.current];
     let total = app.items.len();
 
@@ -3366,6 +3395,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 .border_style(Style::default().fg(theme().outline))
                 .title(" ⚡ Action (f/a/s or ↑↓+Enter, PgUp/PgDn: scroll, p: palette, q: quit) ")
                 .title_style(Style::default().fg(theme().tertiary))
+                .title(ferris_line(crab_tick))
                 .title_bottom(palette_swatch()),
         )
         .highlight_symbol("▸ ");
