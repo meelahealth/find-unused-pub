@@ -864,7 +864,12 @@ fn find_symbol_locations(
         searcher.search_path(
             &matcher,
             path,
-            UTF8(|line_num, _line| {
+            UTF8(|line_num, line| {
+                // Skip comment-only lines (commented-out code shouldn't count)
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    return Ok(true);
+                }
                 locations.push((path.to_path_buf(), line_num as usize));
                 Ok(true)
             }),
@@ -3674,5 +3679,57 @@ pub struct Plain {
         for (f, n) in filters.iter().zip(names.iter()) {
             assert_eq!(f.name(), *n);
         }
+    }
+
+    // -- comment line skipping -----------------------------------------------
+
+    #[test]
+    fn commented_reference_not_counted() {
+        // alpha defines pub fn foo, beta only "references" it in a comment
+        // → foo should be reported as UnusedAnywhere
+        let ws = create_workspace(&[
+            ("alpha", &[("lib.rs", "pub fn foo() {}\n")]),
+            ("beta", &[("lib.rs", "// foo()\n")]),
+        ]);
+        let dirs = crate_dirs(&ws);
+        let whitelist = HashSet::new();
+        let result = analyze_crate(
+            &ws.path().join("crates/alpha"),
+            &dirs,
+            &whitelist,
+            &all_filters(),
+            &|_| {},
+        )
+        .unwrap();
+        let item = result
+            .unused
+            .iter()
+            .find(|u| u.symbol.name == "foo")
+            .expect("foo should be reported as unused");
+        assert_eq!(item.kind, SymbolKind::UnusedAnywhere);
+    }
+
+    #[test]
+    fn real_reference_with_trailing_comment_still_counts() {
+        // alpha defines pub fn bar, beta calls it with a trailing comment
+        // → bar should NOT be reported as unused
+        let ws = create_workspace(&[
+            ("alpha", &[("lib.rs", "pub fn bar() {}\n")]),
+            ("beta", &[("lib.rs", "fn use_it() { bar(); } // call bar\n")]),
+        ]);
+        let dirs = crate_dirs(&ws);
+        let whitelist = HashSet::new();
+        let result = analyze_crate(
+            &ws.path().join("crates/alpha"),
+            &dirs,
+            &whitelist,
+            &all_filters(),
+            &|_| {},
+        )
+        .unwrap();
+        assert!(
+            result.unused.iter().all(|u| u.symbol.name != "bar"),
+            "bar has a real call site and should not be unused"
+        );
     }
 }
