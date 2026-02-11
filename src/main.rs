@@ -311,6 +311,59 @@ fn eq_colors() -> (Color, Color, Color) {
     (a, b, blend)
 }
 
+// ---------------------------------------------------------------------------
+// Shared waveform functions (used by both EQ widget and Ferris)
+// ---------------------------------------------------------------------------
+
+/// Deterministic noise via Knuth multiplicative hash. Returns 0.0–1.0.
+fn eq_noise(seed: u32) -> f64 {
+    let h = seed.wrapping_mul(2654435761);
+    let h = h ^ (h >> 16);
+    (h & 0xFFFF) as f64 / 65536.0
+}
+
+/// Wave A: returns 0.0–1.0 for a given horizontal position and tick.
+fn eq_wave_a(x: f64, tick: u16) -> f64 {
+    let tf = tick as f64;
+    let xi = x as u32;
+    let ti = tick as u32;
+    let beat = ((tf * 0.52).sin() * 0.5 + 0.5)
+        * ((tf * 1.3).sin() * 0.3 + 0.7);
+    let base = (x * 0.3 + tf * 0.5).sin() * 0.2
+        + (x * 0.8 - tf * 0.35).sin() * 0.15
+        + (x * 1.7 + tf * 0.7).sin() * 0.12
+        + (x * 3.1 - tf * 0.9).cos() * 0.08
+        + (x * 5.0 + tf * 1.2).sin() * 0.06;
+    let jitter = (eq_noise(xi.wrapping_mul(31).wrapping_add(ti)) - 0.5) * 0.3;
+    let spike = if eq_noise(xi.wrapping_mul(17).wrapping_add(ti.wrapping_mul(7))) > 0.85 {
+        (eq_noise(xi.wrapping_add(ti)) - 0.5) * 0.5
+    } else {
+        0.0
+    };
+    (0.5 + (base + jitter + spike) * beat).clamp(0.0, 1.0)
+}
+
+/// Wave B: returns 0.0–1.0 for a given horizontal position and tick.
+fn eq_wave_b(x: f64, tick: u16) -> f64 {
+    let tf = tick as f64;
+    let xi = x as u32;
+    let ti = tick as u32;
+    let beat = ((tf * 0.37).sin() * 0.5 + 0.5)
+        * ((tf * 1.1).cos() * 0.35 + 0.65);
+    let base = (x * 0.25 - tf * 0.4).cos() * 0.18
+        + (x * 0.6 + tf * 0.55).sin() * 0.16
+        + (x * 1.4 - tf * 0.8).sin() * 0.1
+        + (x * 2.7 + tf * 0.6).cos() * 0.09
+        + (x * 4.3 - tf * 1.0).sin() * 0.07;
+    let jitter = (eq_noise(xi.wrapping_mul(47).wrapping_add(ti.wrapping_mul(3))) - 0.5) * 0.25;
+    let spike = if eq_noise(xi.wrapping_mul(23).wrapping_add(ti.wrapping_mul(11))) > 0.87 {
+        (eq_noise(xi.wrapping_mul(7).wrapping_add(ti)) - 0.5) * 0.45
+    } else {
+        0.0
+    };
+    (0.5 + (base + jitter + spike) * beat).clamp(0.0, 1.0)
+}
+
 /// Multi-row dual-wave braille visualizer (oscilloscope style).
 /// Two waveforms rendered in contrasting colors; where they overlap the accent color is used.
 fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
@@ -321,55 +374,9 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
         [0x40, 0x80],
     ];
 
-    let tf = tick as f64;
     let total_rows = (height as usize) * 4;
     let max_row = total_rows.saturating_sub(1);
-
-    let noise = |seed: u32| -> f64 {
-        let h = seed.wrapping_mul(2654435761);
-        let h = h ^ (h >> 16);
-        (h & 0xFFFF) as f64 / 65536.0
-    };
-
-    let beat_a = ((tf * 0.52).sin() * 0.5 + 0.5)
-        * ((tf * 1.3).sin() * 0.3 + 0.7);
-    let beat_b = ((tf * 0.37).sin() * 0.5 + 0.5)
-        * ((tf * 1.1).cos() * 0.35 + 0.65);
-
-    let wave_a = |x: f64| -> usize {
-        let xi = x as u32;
-        let ti = tick as u32;
-        let base = (x * 0.3 + tf * 0.5).sin() * 0.2
-            + (x * 0.8 - tf * 0.35).sin() * 0.15
-            + (x * 1.7 + tf * 0.7).sin() * 0.12
-            + (x * 3.1 - tf * 0.9).cos() * 0.08
-            + (x * 5.0 + tf * 1.2).sin() * 0.06;
-        let jitter = (noise(xi.wrapping_mul(31).wrapping_add(ti)) - 0.5) * 0.3;
-        let spike = if noise(xi.wrapping_mul(17).wrapping_add(ti.wrapping_mul(7))) > 0.85 {
-            (noise(xi.wrapping_add(ti)) - 0.5) * 0.5
-        } else {
-            0.0
-        };
-        let v = (0.5 + (base + jitter + spike) * beat_a).clamp(0.0, 1.0);
-        (v * max_row as f64).round().clamp(0.0, max_row as f64) as usize
-    };
-
-    // Second wave: different harmonics and phase offsets.
-    let wave_b = |x: f64| -> usize {
-        let xi = x as u32;
-        let ti = tick as u32;
-        let base = (x * 0.25 - tf * 0.4).cos() * 0.18
-            + (x * 0.6 + tf * 0.55).sin() * 0.16
-            + (x * 1.4 - tf * 0.8).sin() * 0.1
-            + (x * 2.7 + tf * 0.6).cos() * 0.09
-            + (x * 4.3 - tf * 1.0).sin() * 0.07;
-        let jitter = (noise(xi.wrapping_mul(47).wrapping_add(ti.wrapping_mul(3))) - 0.5) * 0.25;
-        let spike = if noise(xi.wrapping_mul(23).wrapping_add(ti.wrapping_mul(11))) > 0.87 {
-            (noise(xi.wrapping_mul(7).wrapping_add(ti)) - 0.5) * 0.45
-        } else {
-            0.0
-        };
-        let v = (0.5 + (base + jitter + spike) * beat_b).clamp(0.0, 1.0);
+    let to_row = |v: f64| -> usize {
         (v * max_row as f64).round().clamp(0.0, max_row as f64) as usize
     };
 
@@ -377,13 +384,13 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
     let samples_a: Vec<usize> = (0..width)
         .flat_map(|col| {
             let x = (col as f64) * 2.0;
-            [wave_a(x), wave_a(x + 1.0)]
+            [to_row(eq_wave_a(x, tick)), to_row(eq_wave_a(x + 1.0, tick))]
         })
         .collect();
     let samples_b: Vec<usize> = (0..width)
         .flat_map(|col| {
             let x = (col as f64) * 2.0;
-            [wave_b(x), wave_b(x + 1.0)]
+            [to_row(eq_wave_b(x, tick)), to_row(eq_wave_b(x + 1.0, tick))]
         })
         .collect();
 
@@ -437,7 +444,7 @@ fn palette_swatch<'a>() -> Line<'a> {
 }
 
 /// Build a right-aligned Ferris animation line for the top border.
-/// Position is driven by the same beat/harmonic algorithm as the EQ waveform.
+/// Position is sampled from the actual EQ waveforms — Ferris vibes with the beat.
 fn ferris_line<'a>(tick: u16) -> Line<'a> {
     const TRACK: usize = 20;
 
@@ -446,13 +453,14 @@ fn ferris_line<'a>(tick: u16) -> Line<'a> {
     let crab_style = Style::default().fg(t.tertiary);
 
     let tf = tick as f64;
-    // Slow, smooth harmonics — no jitter so Ferris glides.
-    let beat = ((tf * 0.52).sin() * 0.5 + 0.5)
-        * ((tf * 1.3).sin() * 0.3 + 0.7);
-    let base = (tf * 0.03).sin() * 0.35
-        + (tf * 0.07).sin() * 0.15
-        + (tf * 0.13).cos() * 0.08;
-    let v = (0.5 + base * beat).clamp(0.0, 1.0);
+    // Sine base gives smooth edge-to-edge locomotion.
+    let base = (tf * 0.08).sin() * 0.5 + 0.5;
+    // Sample both EQ waves at a slow-drifting x and average for a smooth wobble.
+    let x = tf * 0.4;
+    let eq_sample = (eq_wave_a(x, tick) + eq_wave_b(x, tick)) * 0.5;
+    // The EQ sample (0–1) is centered and scaled as a perturbation.
+    let wobble = (eq_sample - 0.5) * 0.25;
+    let v = (base + wobble).clamp(0.0, 1.0);
     let pos = (v * TRACK as f64).round().clamp(0.0, TRACK as f64) as usize;
 
     Line::from(vec![
