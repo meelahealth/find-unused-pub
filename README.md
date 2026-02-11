@@ -135,9 +135,19 @@ Filters are modular plugins that exempt symbols from analysis. Most ship enabled
 
 Uses [tree-sitter-rust](https://github.com/tree-sitter/tree-sitter-rust) for accurate item span detection when deleting items (includes doc comments, attributes, and the full item body).
 
+## Scan cache
+
+Scan results are cached per crate in `.find-unused-pub.db`. On subsequent runs, unchanged crates (same `.rs` file set and modification times) are served from cache instantly. The TUI title bar indicates when cached results are being used.
+
+Pass `--no-cache` to force a full rescan. You can also clear the cache manually:
+
+```bash
+sqlite3 .find-unused-pub.db 'DELETE FROM scan_cache'
+```
+
 ## Allowlist
 
-False positives can be allowlisted during review mode. The allowlist is stored in a SQLite database at `.find-unused-pub.db` in the workspace root (gitignored).
+False positives can be allowlisted during review mode. The allowlist is stored in the same SQLite database at `.find-unused-pub.db` in the workspace root (gitignored).
 
 ## Caveats
 
