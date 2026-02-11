@@ -437,6 +437,7 @@ fn palette_swatch<'a>() -> Line<'a> {
 }
 
 /// Build a right-aligned Ferris animation line for the top border.
+/// Position is driven by the same beat/harmonic algorithm as the EQ waveform.
 fn ferris_line<'a>(tick: u16) -> Line<'a> {
     const TRACK: usize = 20;
 
@@ -444,9 +445,15 @@ fn ferris_line<'a>(tick: u16) -> Line<'a> {
     let dot_style = Style::default().fg(t.outline);
     let crab_style = Style::default().fg(t.tertiary);
 
-    let cycle = (TRACK * 2) as u16;
-    let pos = (tick % cycle) as usize;
-    let pos = if pos < TRACK { pos } else { TRACK * 2 - pos };
+    let tf = tick as f64;
+    // Slow, smooth harmonics — no jitter so Ferris glides.
+    let beat = ((tf * 0.52).sin() * 0.5 + 0.5)
+        * ((tf * 1.3).sin() * 0.3 + 0.7);
+    let base = (tf * 0.03).sin() * 0.35
+        + (tf * 0.07).sin() * 0.15
+        + (tf * 0.13).cos() * 0.08;
+    let v = (0.5 + base * beat).clamp(0.0, 1.0);
+    let pos = (v * TRACK as f64).round().clamp(0.0, TRACK as f64) as usize;
 
     Line::from(vec![
         Span::raw(" "),
