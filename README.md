@@ -64,7 +64,9 @@ find-unused-pub --nuke-allowlist
 | `--fix` | Alias for `--fix-crate-internal` |
 | `--fix-crate-internal` | Auto-fix crate-internal items to `pub(crate)` |
 | `--fix-unused` | Auto-fix unused items by deleting them entirely |
+| `--yeet` | Alias for `--fix-unused` |
 | `--nuke-allowlist` | Clear the SQLite allowlist database |
+| `--slay` | Clear both the scan cache and the allowlist |
 
 Flags compose: `--fix --fix-unused` fixes both categories.
 

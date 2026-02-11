@@ -366,6 +366,10 @@ struct Args {
     #[arg(long)]
     fix_unused: bool,
 
+    /// Alias for --fix-unused
+    #[arg(long)]
+    yeet: bool,
+
     /// Alias for --fix-crate-internal
     #[arg(long)]
     fix: bool,
@@ -373,6 +377,10 @@ struct Args {
     /// Clear the allowlist database
     #[arg(long)]
     nuke_allowlist: bool,
+
+    /// Clear both the scan cache and the allowlist
+    #[arg(long)]
+    slay: bool,
 
     /// Ignore crate paths (relative to workspace root, repeatable)
     #[arg(long, env = "FIND_UNUSED_PUB_IGNORE", value_delimiter = ',')]
@@ -394,6 +402,12 @@ struct Args {
 impl Args {
     fn should_fix_crate_internal(&self) -> bool {
         self.fix_crate_internal || self.fix
+    }
+    fn should_fix_unused(&self) -> bool {
+        self.fix_unused || self.yeet
+    }
+    fn should_nuke(&self) -> bool {
+        self.nuke_allowlist || self.slay
     }
 }
 
@@ -3401,17 +3415,22 @@ async fn main() -> Result<()> {
     let workspace_root = find_workspace_root()?;
     let crates_dir = workspace_root.join("crates");
 
-    // Handle --nuke-allowlist
+    // Handle --nuke-allowlist / --slay
     let conn = open_db(&workspace_root)?;
-    if args.nuke_allowlist {
+    if args.should_nuke() {
         nuke_allowlist(&conn)?;
         eprintln!("{}", "Allowlist cleared.".green());
-        if args.crate_paths.is_empty()
-            && !args.should_fix_crate_internal()
-            && !args.fix_unused
-        {
-            return Ok(());
-        }
+    }
+    if args.slay {
+        conn.execute("DELETE FROM scan_cache", [])?;
+        eprintln!("{}", "Scan cache cleared.".green());
+    }
+    if args.should_nuke()
+        && args.crate_paths.is_empty()
+        && !args.should_fix_crate_internal()
+        && !args.should_fix_unused()
+    {
+        return Ok(());
     }
 
     let allowlist = load_allowlist(&conn)?;
@@ -3474,7 +3493,7 @@ async fn main() -> Result<()> {
         .collect();
 
     // Non-interactive batch fix: must await all results first
-    if args.should_fix_crate_internal() || args.fix_unused {
+    if args.should_fix_crate_internal() || args.should_fix_unused() {
         let mut results = vec![];
         for (i, crate_path) in target_crates.iter().enumerate() {
             let crate_name = crate_path.file_name().unwrap().to_str().unwrap();
@@ -3502,7 +3521,7 @@ async fn main() -> Result<()> {
         for item in &all_unused {
             let should_fix = match item.kind {
                 SymbolKind::CrateInternalOnly { .. } => args.should_fix_crate_internal(),
-                SymbolKind::UnusedAnywhere => args.fix_unused,
+                SymbolKind::UnusedAnywhere => args.should_fix_unused(),
             };
             if should_fix {
                 let label = match item.kind {
