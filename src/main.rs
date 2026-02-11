@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -29,19 +30,26 @@ use rusqlite::Connection;
 // Catppuccin theme
 // ---------------------------------------------------------------------------
 
-static FLAVOR: OnceLock<&'static catppuccin::FlavorColors> = OnceLock::new();
-static PALETTE_NAME: OnceLock<&'static str> = OnceLock::new();
+/// Palette index: 0=latte, 1=frappe, 2=macchiato, 3=mocha.
+static PALETTE_IDX: AtomicU8 = AtomicU8::new(3);
 static ACTIVE_FILTER_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
 static IGNORED_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 
-/// Get the active catppuccin flavor (set at startup via --palette).
+/// Get the active catppuccin flavor (resolved live from PALETTE_IDX).
 fn flavor() -> &'static catppuccin::FlavorColors {
-    FLAVOR.get().copied().expect("palette not initialized")
+    Palette::from_index(PALETTE_IDX.load(Ordering::Relaxed)).flavor_colors()
 }
 
 /// Get the active palette name for display.
 fn palette_name() -> &'static str {
-    PALETTE_NAME.get().copied().unwrap_or("mocha")
+    Palette::from_index(PALETTE_IDX.load(Ordering::Relaxed)).name()
+}
+
+/// Cycle to the next palette and return its name.
+fn cycle_palette() -> &'static str {
+    let next = (PALETTE_IDX.load(Ordering::Relaxed) + 1) % 4;
+    PALETTE_IDX.store(next, Ordering::Relaxed);
+    Palette::from_index(next).name()
 }
 
 /// Get the list of active filter names for TUI display.
@@ -87,6 +95,24 @@ impl Palette {
             Palette::Frappe => "frappe",
             Palette::Macchiato => "macchiato",
             Palette::Mocha => "mocha",
+        }
+    }
+
+    fn to_index(self) -> u8 {
+        match self {
+            Palette::Latte => 0,
+            Palette::Frappe => 1,
+            Palette::Macchiato => 2,
+            Palette::Mocha => 3,
+        }
+    }
+
+    fn from_index(idx: u8) -> Self {
+        match idx {
+            0 => Palette::Latte,
+            1 => Palette::Frappe,
+            2 => Palette::Macchiato,
+            _ => Palette::Mocha,
         }
     }
 }
@@ -775,6 +801,11 @@ fn count_symbol_hits(
             &matcher,
             path,
             UTF8(|_line_num, line| {
+                // Skip comment-only lines (commented-out code shouldn't count)
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    return Ok(true);
+                }
                 for m in word_re.find_iter(line) {
                     let sym = m.as_str().to_string();
                     *counts.entry(sym).or_insert(0) += 1;
@@ -1633,6 +1664,9 @@ fn run_tui_main_loop(
                             KeyCode::Char('k') | KeyCode::Up => {
                                 app.detail_scroll = app.detail_scroll.saturating_sub(1);
                             }
+                            KeyCode::Char('p') => {
+                                cycle_palette();
+                            }
                             _ => {}
                         }
                     }
@@ -1754,6 +1788,9 @@ fn run_tui_main_loop(
                                     handle_summary_action(SummaryAction::FixAllCrateInternal, app)?;
                                 }
                             }
+                            KeyCode::Char('p') => {
+                                cycle_palette();
+                            }
                             _ => {}
                         }
                     }
@@ -1841,6 +1878,9 @@ fn run_tui_main_loop(
                                 KeyCode::Esc => {
                                     // Back to summary (apply actions taken so far)
                                     finish_review(app)?;
+                                }
+                                KeyCode::Char('p') => {
+                                    cycle_palette();
                                 }
                                 _ => {}
                             }
@@ -2165,7 +2205,7 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ctp(flavor().surface2)))
-                .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, j/k: scroll, q: quit) ")
+                .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, j/k: scroll, p: palette, q: quit) ")
                 .title_style(Style::default().fg(ctp(flavor().peach))),
         )
         .highlight_symbol("▸ ");
@@ -2786,8 +2826,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    FLAVOR.set(args.palette.flavor_colors()).expect("palette already set");
-    PALETTE_NAME.set(args.palette.name()).expect("palette name already set");
+    PALETTE_IDX.store(args.palette.to_index(), Ordering::Relaxed);
 
     // Validate --disable-filter values
     let known = all_filter_names();
