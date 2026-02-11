@@ -1284,6 +1284,8 @@ fn simple_hash(data: &[u8]) -> u64 {
 }
 
 /// Try to load a cached scan result for a crate.
+/// Returns `None` on cache miss, hash mismatch, or deserialization failure
+/// (e.g. if the shape of CrateResult changed since the entry was written).
 fn load_cached_result(conn: &Connection, crate_name: &str, expected_hash: &str) -> Option<CrateResult> {
     let mut stmt = conn
         .prepare("SELECT content_hash, results_json FROM scan_cache WHERE crate_name = ?1")
