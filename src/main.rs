@@ -2761,6 +2761,7 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
 
     let rows = Layout::vertical([
         Constraint::Min(5),    // content
+        Constraint::Length(3), // EQ waveform
         Constraint::Length(3), // actions bar
     ])
     .split(frame.area());
@@ -2775,6 +2776,10 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
                 .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(widget, rows[0]);
+
+    let eq = Paragraph::new(eq_widget(app.crab_tick, rows[1].width, rows[1].height))
+        .style(Style::default().bg(theme().surface));
+    frame.render_widget(eq, rows[1]);
 
     let bar = Paragraph::new(Line::from(vec![
         Span::styled(" p", Style::default().fg(theme().tertiary).add_modifier(Modifier::BOLD)),
@@ -2791,7 +2796,7 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
             .title(ferris_line(app.crab_tick))
             .title_bottom(palette_swatch()),
     );
-    frame.render_widget(bar, rows[1]);
+    frame.render_widget(bar, rows[2]);
 }
 
 fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
@@ -3238,9 +3243,10 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp, crab_tick: u16) {
         GitLoadState::Done(info) if info.log_entry.as_ref().is_some_and(|e| e.definition_only)
     );
 
-    // Top-level: main content area + action bar at bottom
+    // Top-level: main content area + EQ waveform + action bar at bottom
     let rows = Layout::vertical([
         Constraint::Min(8),     // main content
+        Constraint::Length(3),  // EQ waveform
         Constraint::Length(5),  // actions
     ])
     .split(frame.area());
@@ -3446,6 +3452,11 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp, crab_tick: u16) {
         );
     frame.render_widget(patch_block, cols[1]);
 
+    // -- EQ visualizer --
+    let eq = Paragraph::new(eq_widget(crab_tick, rows[1].width, rows[1].height))
+        .style(Style::default().bg(theme().surface));
+    frame.render_widget(eq, rows[1]);
+
     // -- Action selector (bottom, full width) --
     let fix_label = if is_definition_only {
         match item.kind {
@@ -3486,7 +3497,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp, crab_tick: u16) {
                 .title_bottom(palette_swatch()),
         )
         .highlight_symbol("▸ ");
-    frame.render_stateful_widget(action_list, rows[1], &mut list_state);
+    frame.render_stateful_widget(action_list, rows[2], &mut list_state);
 }
 
 // ---------------------------------------------------------------------------
