@@ -270,65 +270,85 @@ fn theme() -> &'static ThemeColors {
     &themes[idx.min(themes.len() - 1)]
 }
 
-/// Braille waveform visualizer for the summary bottom border.
-/// Chaotic oscilloscope-style line with harmonics, noise, and beat-driven amplitude.
-fn eq_visualizer<'a>(tick: u16, width: u16) -> Line<'a> {
+/// Multi-row braille waveform visualizer (oscilloscope style).
+/// Each cell row = 4 braille dot rows, so `height` cells = `height * 4` vertical levels.
+fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
+    // Braille dot bits per row within a cell.
     const DOT: [[u32; 2]; 4] = [
-        [0x01, 0x08], // row 0 (top)
-        [0x02, 0x10], // row 1
-        [0x04, 0x20], // row 2
-        [0x40, 0x80], // row 3 (bottom)
+        [0x01, 0x08],
+        [0x02, 0x10],
+        [0x04, 0x20],
+        [0x40, 0x80],
     ];
 
     let t = theme();
     let tf = tick as f64;
+    let total_rows = (height as usize) * 4; // total vertical dot positions
+    let max_row = total_rows.saturating_sub(1);
 
-    // Cheap deterministic noise via Knuth multiplicative hash.
     let noise = |seed: u32| -> f64 {
         let h = seed.wrapping_mul(2654435761);
         let h = h ^ (h >> 16);
         (h & 0xFFFF) as f64 / 65536.0
     };
 
-    // Beat envelope — amplitude pulses like music (~128 BPM at 100ms ticks)
     let beat = ((tf * 0.52).sin() * 0.5 + 0.5)
         * ((tf * 1.3).sin() * 0.3 + 0.7);
 
-    let wave = |x: f64| -> f64 {
+    // Returns a dot-row index (0 = top, max_row = bottom)
+    let wave = |x: f64| -> usize {
         let xi = x as u32;
         let ti = tick as u32;
-        // Harmonics at different frequencies
         let base = (x * 0.3 + tf * 0.5).sin() * 0.2
             + (x * 0.8 - tf * 0.35).sin() * 0.15
             + (x * 1.7 + tf * 0.7).sin() * 0.12
             + (x * 3.1 - tf * 0.9).cos() * 0.08
             + (x * 5.0 + tf * 1.2).sin() * 0.06;
-        // High-frequency jitter (changes each tick per column)
         let jitter = (noise(xi.wrapping_mul(31).wrapping_add(ti)) - 0.5) * 0.3;
-        // Occasional sharp spikes
         let spike = if noise(xi.wrapping_mul(17).wrapping_add(ti.wrapping_mul(7))) > 0.85 {
             (noise(xi.wrapping_add(ti)) - 0.5) * 0.5
         } else {
             0.0
         };
-        (0.5 + (base + jitter + spike) * beat).clamp(0.0, 1.0)
+        let v = (0.5 + (base + jitter + spike) * beat).clamp(0.0, 1.0);
+        (v * max_row as f64).round().clamp(0.0, max_row as f64) as usize
     };
 
-    let spans: Vec<Span<'a>> = (0..width)
-        .map(|col| {
-            let x_left = (col as f64) * 2.0;
-            let x_right = x_left + 1.0;
-
-            let row_left = (wave(x_left) * 3.0).round().clamp(0.0, 3.0) as usize;
-            let row_right = (wave(x_right) * 3.0).round().clamp(0.0, 3.0) as usize;
-
-            let bits = 0x2800u32 | DOT[row_left][0] | DOT[row_right][1];
-            let ch = char::from_u32(bits).unwrap_or(' ');
-
-            Span::styled(String::from(ch), Style::default().fg(t.tertiary))
+    // Pre-compute wave dot-row for each horizontal sample (2 per cell column).
+    let samples: Vec<usize> = (0..width)
+        .flat_map(|col| {
+            let x = (col as f64) * 2.0;
+            [wave(x), wave(x + 1.0)]
         })
         .collect();
-    Line::from(spans)
+
+    // Build one Line per cell row.
+    let lines: Vec<Line<'a>> = (0..height as usize)
+        .map(|cell_row| {
+            let spans: Vec<Span<'a>> = (0..width as usize)
+                .map(|col| {
+                    let left_dot = samples[col * 2];
+                    let right_dot = samples[col * 2 + 1];
+                    let mut bits = 0x2800u32;
+                    // Check if the dot-row for left/right sample falls within this cell row.
+                    let cell_top = cell_row * 4;
+                    for dot_row in 0..4usize {
+                        let global_row = cell_top + dot_row;
+                        if left_dot == global_row {
+                            bits |= DOT[dot_row][0];
+                        }
+                        if right_dot == global_row {
+                            bits |= DOT[dot_row][1];
+                        }
+                    }
+                    let ch = char::from_u32(bits).unwrap_or(' ');
+                    Span::styled(String::from(ch), Style::default().fg(t.tertiary))
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    Text::from(lines)
 }
 
 /// Build a palette swatch line: colored blocks for each theme color + name.
@@ -2777,9 +2797,10 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
 fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
     let dim = Style::default().fg(theme().dim);
 
-    // Layout: content area + menu at bottom
+    // Layout: content area + EQ visualizer + menu at bottom
     let rows = Layout::vertical([
         Constraint::Min(10),   // content
+        Constraint::Length(3), // EQ waveform
         Constraint::Length(8), // menu
     ])
     .split(frame.area());
@@ -2803,6 +2824,11 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         SummaryView::Detail => draw_summary_detail(frame, app, rows[0], &title, dim),
         SummaryView::Skipped => draw_summary_skipped(frame, app, rows[0], &title, dim),
     }
+
+    // -- EQ visualizer --
+    let eq = Paragraph::new(eq_widget(app.crab_tick, rows[1].width, rows[1].height))
+        .style(Style::default().bg(theme().surface));
+    frame.render_widget(eq, rows[1]);
 
     // -- Menu (shared by all views) --
     let menu = summary_menu_items(app);
@@ -2839,7 +2865,7 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
                 .title_bottom(palette_swatch()),
         )
         .highlight_symbol("▸ ");
-    frame.render_stateful_widget(menu_widget, rows[1], &mut list_state);
+    frame.render_stateful_widget(menu_widget, rows[2], &mut list_state);
 }
 
 fn draw_summary_table(
@@ -2950,7 +2976,6 @@ fn draw_summary_table(
     }
     table_lines.push(Line::from(total_spans));
 
-    let eq_width = area.width.saturating_sub(2);
     let table_widget = Paragraph::new(Text::from(table_lines))
         .scroll((app.detail_scroll, 0))
         .block(
@@ -2958,8 +2983,7 @@ fn draw_summary_table(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme().outline))
                 .title(title.to_string())
-                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD))
-                .title_bottom(eq_visualizer(app.crab_tick, eq_width)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(table_widget, area);
 }
@@ -3091,7 +3115,6 @@ fn draw_summary_detail(
         lines.push(Line::from(Span::styled("No issues found.", dim)));
     }
 
-    let eq_width = area.width.saturating_sub(2);
     let detail_widget = Paragraph::new(Text::from(lines))
         .scroll((app.detail_scroll, 0))
         .block(
@@ -3099,8 +3122,7 @@ fn draw_summary_detail(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme().outline))
                 .title(title.to_string())
-                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD))
-                .title_bottom(eq_visualizer(app.crab_tick, eq_width)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(detail_widget, area);
 }
@@ -3187,7 +3209,6 @@ fn draw_summary_skipped(
         lines.push(Line::from(Span::styled("No symbols were skipped.", dim)));
     }
 
-    let eq_width = area.width.saturating_sub(2);
     let widget = Paragraph::new(Text::from(lines))
         .scroll((app.detail_scroll, 0))
         .block(
@@ -3195,8 +3216,7 @@ fn draw_summary_skipped(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme().outline))
                 .title(title.to_string())
-                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD))
-                .title_bottom(eq_visualizer(app.crab_tick, eq_width)),
+                .title_style(Style::default().fg(theme().primary).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(widget, area);
 }
