@@ -334,23 +334,31 @@ fn eq_wave_samples(tick: u16, n: usize, channel: u8) -> Vec<f64> {
     let sqrt2 = std::f64::consts::SQRT_2;
     let tau = std::f64::consts::TAU;
 
-    // ── Primary shape: original sine harmonics (restored from pre-wavegen) ──
+    // ── Primary shape: sine harmonics with slow emergent drift ──────────
+    // Amplitudes and frequency multipliers modulate on ultra-slow timescales
+    // (periods of ~30-90 seconds) so the wave character gradually morphs.
+    // Each modulator oscillates in a narrow range around the base value.
+    let drift = |rate: f64, depth: f64| -> f64 {
+        1.0 + (tf * rate).sin() * depth
+    };
     let primary = |x: f64| -> f64 {
         let xi = x as u32;
         let phase_seed = if channel == 0 { xi.wrapping_mul(2017) } else { xi.wrapping_mul(3011) };
         let phase = eq_noise(phase_seed) * tau;
         if channel == 0 {
-            (x * 0.047 * phi + tf * 0.5 + phase).sin() * 0.2
-                + (x * 0.083 * sqrt2 - tf * 0.35).sin() * 0.15
-                + (x * 0.131 + tf * 0.7).sin() * 0.12
-                + (x * 0.199 * phi - tf * 0.9).cos() * 0.08
-                + (x * 0.317 + tf * 1.2 + phase * 0.5).sin() * 0.06
+            // Amplitude drift: ±20-30% over ~40-80s cycles
+            // Frequency drift: ±5-8% over ~50-90s cycles
+            (x * 0.047 * phi * drift(0.007, 0.06) + tf * 0.5 + phase).sin() * 0.2 * drift(0.013, 0.25)
+                + (x * 0.083 * sqrt2 * drift(0.005, 0.05) - tf * 0.35).sin() * 0.15 * drift(0.009, 0.30)
+                + (x * 0.131 * drift(0.011, 0.07) + tf * 0.7).sin() * 0.12 * drift(0.017, 0.20)
+                + (x * 0.199 * phi * drift(0.003, 0.08) - tf * 0.9).cos() * 0.08 * drift(0.021, 0.25)
+                + (x * 0.317 * drift(0.009, 0.05) + tf * 1.2 + phase * 0.5).sin() * 0.06 * drift(0.015, 0.30)
         } else {
-            (x * 0.041 - tf * 0.4 + phase).cos() * 0.18
-                + (x * 0.071 * phi + tf * 0.55).sin() * 0.16
-                + (x * 0.113 * sqrt2 - tf * 0.8).sin() * 0.1
-                + (x * 0.173 + tf * 0.6 + phase * 0.7).cos() * 0.09
-                + (x * 0.281 * phi - tf * 1.0).sin() * 0.07
+            (x * 0.041 * drift(0.006, 0.06) - tf * 0.4 + phase).cos() * 0.18 * drift(0.011, 0.25)
+                + (x * 0.071 * phi * drift(0.008, 0.05) + tf * 0.55).sin() * 0.16 * drift(0.014, 0.30)
+                + (x * 0.113 * sqrt2 * drift(0.004, 0.07) - tf * 0.8).sin() * 0.1 * drift(0.019, 0.20)
+                + (x * 0.173 * drift(0.010, 0.08) + tf * 0.6 + phase * 0.7).cos() * 0.09 * drift(0.023, 0.25)
+                + (x * 0.281 * phi * drift(0.012, 0.05) - tf * 1.0).sin() * 0.07 * drift(0.016, 0.30)
         }
     };
 
