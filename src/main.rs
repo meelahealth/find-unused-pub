@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,10 +26,21 @@ use ratatui::Terminal;
 use rusqlite::Connection;
 
 // ---------------------------------------------------------------------------
-// Catppuccin Mocha theme
+// Catppuccin theme
 // ---------------------------------------------------------------------------
 
-const MOCHA: &catppuccin::FlavorColors = &catppuccin::PALETTE.mocha.colors;
+static FLAVOR: OnceLock<&'static catppuccin::FlavorColors> = OnceLock::new();
+static PALETTE_NAME: OnceLock<&'static str> = OnceLock::new();
+
+/// Get the active catppuccin flavor (set at startup via --palette).
+fn flavor() -> &'static catppuccin::FlavorColors {
+    FLAVOR.get().copied().expect("palette not initialized")
+}
+
+/// Get the active palette name for display.
+fn palette_name() -> &'static str {
+    PALETTE_NAME.get().copied().unwrap_or("mocha")
+}
 
 /// Convert a catppuccin color to ratatui Color.
 fn ctp(color: catppuccin::Color) -> Color {
@@ -40,6 +51,34 @@ fn ctp(color: catppuccin::Color) -> Color {
 // CLI
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum Palette {
+    Latte,
+    Frappe,
+    Macchiato,
+    Mocha,
+}
+
+impl Palette {
+    fn flavor_colors(self) -> &'static catppuccin::FlavorColors {
+        match self {
+            Palette::Latte => &catppuccin::PALETTE.latte.colors,
+            Palette::Frappe => &catppuccin::PALETTE.frappe.colors,
+            Palette::Macchiato => &catppuccin::PALETTE.macchiato.colors,
+            Palette::Mocha => &catppuccin::PALETTE.mocha.colors,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Palette::Latte => "latte",
+            Palette::Frappe => "frappe",
+            Palette::Macchiato => "macchiato",
+            Palette::Mocha => "mocha",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "find-unused-pub",
@@ -47,6 +86,9 @@ fn ctp(color: catppuccin::Color) -> Color {
     version
 )]
 struct Args {
+    /// Catppuccin palette (latte, frappe, macchiato, mocha)
+    #[arg(long, value_enum, default_value = "mocha")]
+    palette: Palette,
     /// Crate paths to scan (defaults to all crates/*)
     crate_paths: Vec<PathBuf>,
 
@@ -1796,7 +1838,7 @@ fn finish_review(app: &mut App) -> Result<()> {
 }
 
 fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
-    let dim = Style::default().fg(ctp(MOCHA.overlay0));
+    let dim = Style::default().fg(ctp(flavor().overlay0));
     let scan = app.scan.as_ref().unwrap();
 
     let done_count = scan.completed.iter().filter(|c| c.is_some()).count();
@@ -1811,10 +1853,11 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         .unwrap_or(10);
 
     let title = format!(
-        " 🔍 find-unused-pub — scanning ({}/{} crates, {:.1}s) ",
+        " 🔍 find-unused-pub — scanning ({}/{} crates, {:.1}s) [{}] ",
         done_count,
         total,
-        elapsed.as_secs_f64()
+        elapsed.as_secs_f64(),
+        palette_name(),
     );
 
     let mut lines: Vec<Line> = vec![];
@@ -1834,8 +1877,8 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
                 .count();
 
             let mut spans = vec![
-                Span::styled("  ✅ ", Style::default().fg(ctp(MOCHA.green))),
-                Span::styled(name_padded, Style::default().fg(ctp(MOCHA.sapphire))),
+                Span::styled("  ✅ ", Style::default().fg(ctp(flavor().green))),
+                Span::styled(name_padded, Style::default().fg(ctp(flavor().sapphire))),
                 Span::raw("  "),
                 Span::styled(format!("{:>3} found", result.items_found), dim),
             ];
@@ -1844,19 +1887,19 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     format!("❗ {n_unused} unused"),
-                    Style::default().fg(ctp(MOCHA.red)),
+                    Style::default().fg(ctp(flavor().red)),
                 ));
             }
             if n_internal > 0 {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     format!("🔧 {n_internal} internal"),
-                    Style::default().fg(ctp(MOCHA.yellow)),
+                    Style::default().fg(ctp(flavor().yellow)),
                 ));
             }
             if n_unused == 0 && n_internal == 0 {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled("✨ clean", Style::default().fg(ctp(MOCHA.green))));
+                spans.push(Span::styled("✨ clean", Style::default().fg(ctp(flavor().green))));
             }
 
             lines.push(Line::from(spans));
@@ -1865,11 +1908,11 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
             let stage_span = if stage.is_empty() {
                 Span::styled("waiting…", dim)
             } else {
-                Span::styled(stage.as_str(), Style::default().fg(ctp(MOCHA.peach)))
+                Span::styled(stage.as_str(), Style::default().fg(ctp(flavor().peach)))
             };
             lines.push(Line::from(vec![
-                Span::styled("  ⏳ ", Style::default().fg(ctp(MOCHA.peach))),
-                Span::styled(name_padded, Style::default().fg(ctp(MOCHA.subtext0))),
+                Span::styled("  ⏳ ", Style::default().fg(ctp(flavor().peach))),
+                Span::styled(name_padded, Style::default().fg(ctp(flavor().subtext0))),
                 Span::raw("  "),
                 stage_span,
             ]));
@@ -1881,15 +1924,15 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(title)
-                .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(widget, frame.area());
 }
 
 fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
-    let dim = Style::default().fg(ctp(MOCHA.overlay0));
+    let dim = Style::default().fg(ctp(flavor().overlay0));
 
     // Layout: content area + menu at bottom
     let rows = Layout::vertical([
@@ -1904,10 +1947,11 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         SummaryView::Skipped => "🛡️ skipped",
     };
     let title = format!(
-        " 📦 find-unused-pub — {} crates in {:.1}s ({}) ",
+        " 📦 find-unused-pub — {} crates in {:.1}s ({}) [{}] ",
         app.results.len(),
         app.elapsed.as_secs_f64(),
         view_label,
+        palette_name(),
     );
 
     match app.summary_view {
@@ -1924,16 +1968,16 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         .map(|(i, (action, label))| {
             let style = if i == app.summary_selected {
                 Style::default()
-                    .fg(ctp(MOCHA.base))
-                    .bg(ctp(MOCHA.lavender))
+                    .fg(ctp(flavor().base))
+                    .bg(ctp(flavor().lavender))
                     .add_modifier(Modifier::BOLD)
             } else {
                 match action {
-                    SummaryAction::ReviewUnused => Style::default().fg(ctp(MOCHA.green)),
-                    SummaryAction::ReviewCrateInternal => Style::default().fg(ctp(MOCHA.sapphire)),
-                    SummaryAction::FixAllUnused => Style::default().fg(ctp(MOCHA.red)),
-                    SummaryAction::FixAllCrateInternal => Style::default().fg(ctp(MOCHA.green)),
-                    SummaryAction::Quit => Style::default().fg(ctp(MOCHA.text)),
+                    SummaryAction::ReviewUnused => Style::default().fg(ctp(flavor().green)),
+                    SummaryAction::ReviewCrateInternal => Style::default().fg(ctp(flavor().sapphire)),
+                    SummaryAction::FixAllUnused => Style::default().fg(ctp(flavor().red)),
+                    SummaryAction::FixAllCrateInternal => Style::default().fg(ctp(flavor().green)),
+                    SummaryAction::Quit => Style::default().fg(ctp(flavor().text)),
                 }
             };
             ListItem::new(label.as_str()).style(style)
@@ -1944,9 +1988,9 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, j/k: scroll, q: quit) ")
-                .title_style(Style::default().fg(ctp(MOCHA.peach))),
+                .title_style(Style::default().fg(ctp(flavor().peach))),
         )
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(menu_widget, rows[1], &mut list_state);
@@ -1984,7 +2028,7 @@ fn draw_summary_table(
         let found_str = format!("{:>3} found", result.items_found);
 
         let mut spans = vec![
-            Span::styled(name_padded, Style::default().fg(ctp(MOCHA.sapphire))),
+            Span::styled(name_padded, Style::default().fg(ctp(flavor().sapphire))),
             Span::raw("  "),
             Span::styled(found_str, dim),
         ];
@@ -1993,19 +2037,19 @@ fn draw_summary_table(
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
                 format!("❗ {n_unused} unused"),
-                Style::default().fg(ctp(MOCHA.red)),
+                Style::default().fg(ctp(flavor().red)),
             ));
         }
         if n_internal > 0 {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
                 format!("🔧 {n_internal} internal"),
-                Style::default().fg(ctp(MOCHA.yellow)),
+                Style::default().fg(ctp(flavor().yellow)),
             ));
         }
         if n_unused == 0 && n_internal == 0 {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled("✨ clean", Style::default().fg(ctp(MOCHA.green))));
+            spans.push(Span::styled("✨ clean", Style::default().fg(ctp(flavor().green))));
         }
 
         table_lines.push(Line::from(spans));
@@ -2027,7 +2071,7 @@ fn draw_summary_table(
     let mut total_spans = vec![
         Span::styled(
             format!("{:<width$}", "TOTAL", width = max_name_len),
-            Style::default().fg(ctp(MOCHA.text)).add_modifier(Modifier::BOLD),
+            Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(format!("{:>3} found", total_found), dim),
@@ -2036,7 +2080,7 @@ fn draw_summary_table(
         total_spans.push(Span::raw("  "));
         total_spans.push(Span::styled(
             format!("❗ {total_unused} unused"),
-            Style::default().fg(ctp(MOCHA.red)).add_modifier(Modifier::BOLD),
+            Style::default().fg(ctp(flavor().red)).add_modifier(Modifier::BOLD),
         ));
     }
     if total_internal > 0 {
@@ -2044,7 +2088,7 @@ fn draw_summary_table(
         total_spans.push(Span::styled(
             format!("🔧 {total_internal} internal"),
             Style::default()
-                .fg(ctp(MOCHA.yellow))
+                .fg(ctp(flavor().yellow))
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -2053,7 +2097,7 @@ fn draw_summary_table(
         total_spans.push(Span::styled(
             "✨ all clean!",
             Style::default()
-                .fg(ctp(MOCHA.green))
+                .fg(ctp(flavor().green))
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -2064,9 +2108,9 @@ fn draw_summary_table(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(title.to_string())
-                .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(table_widget, area);
 }
@@ -2084,7 +2128,7 @@ fn draw_summary_detail(
     lines.push(Line::from(vec![
         Span::styled(
             format!("📋 {total_unused} issues"),
-            Style::default().fg(ctp(MOCHA.text)).add_modifier(Modifier::BOLD),
+            Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled("j/k: navigate crates, Space: expand/collapse", dim),
@@ -2107,17 +2151,17 @@ fn draw_summary_detail(
 
         let name_style = if is_focused {
             Style::default()
-                .fg(ctp(MOCHA.sapphire))
+                .fg(ctp(flavor().sapphire))
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default()
-                .fg(ctp(MOCHA.sapphire))
+                .fg(ctp(flavor().sapphire))
                 .add_modifier(Modifier::BOLD)
         };
 
         let mut header_spans = vec![
-            Span::styled(cursor_indicator, Style::default().fg(ctp(MOCHA.lavender))),
-            Span::styled(format!("{arrow} "), Style::default().fg(ctp(MOCHA.overlay1))),
+            Span::styled(cursor_indicator, Style::default().fg(ctp(flavor().lavender))),
+            Span::styled(format!("{arrow} "), Style::default().fg(ctp(flavor().overlay1))),
             Span::styled(&result.crate_name, name_style),
             Span::raw(" "),
             Span::styled(
@@ -2129,14 +2173,14 @@ fn draw_summary_detail(
             header_spans.push(Span::raw("  "));
             header_spans.push(Span::styled(
                 format!("❗ {n_unused}"),
-                Style::default().fg(ctp(MOCHA.red)),
+                Style::default().fg(ctp(flavor().red)),
             ));
         }
         if n_internal > 0 {
             header_spans.push(Span::raw("  "));
             header_spans.push(Span::styled(
                 format!("🔧 {n_internal}"),
-                Style::default().fg(ctp(MOCHA.yellow)),
+                Style::default().fg(ctp(flavor().yellow)),
             ));
         }
         lines.push(Line::from(header_spans));
@@ -2149,7 +2193,7 @@ fn draw_summary_detail(
                             Span::raw("      "),
                             Span::styled(
                                 format!("❗ {}", item.symbol.name),
-                                Style::default().fg(ctp(MOCHA.red)),
+                                Style::default().fg(ctp(flavor().red)),
                             ),
                             Span::raw(" "),
                             Span::styled("unused everywhere", dim),
@@ -2160,7 +2204,7 @@ fn draw_summary_detail(
                             Span::raw("      "),
                             Span::styled(
                                 format!("🔧 {}", item.symbol.name),
-                                Style::default().fg(ctp(MOCHA.yellow)),
+                                Style::default().fg(ctp(flavor().yellow)),
                             ),
                             Span::raw(" "),
                             Span::styled(
@@ -2177,7 +2221,7 @@ fn draw_summary_detail(
                     .unwrap_or(&item.symbol.file);
                 lines.push(Line::from(Span::styled(
                     format!("        {}:{}", rel_path.display(), item.symbol.line),
-                    Style::default().fg(ctp(MOCHA.subtext0)),
+                    Style::default().fg(ctp(flavor().subtext0)),
                 )));
                 for (ref_file, ref_line) in &item.internal_refs {
                     let rel = ref_file
@@ -2185,7 +2229,7 @@ fn draw_summary_detail(
                         .unwrap_or(ref_file);
                     lines.push(Line::from(Span::styled(
                         format!("          ↳ {}:{}", rel.display(), ref_line),
-                        Style::default().fg(ctp(MOCHA.overlay1)),
+                        Style::default().fg(ctp(flavor().overlay1)),
                     )));
                 }
             }
@@ -2202,9 +2246,9 @@ fn draw_summary_detail(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(title.to_string())
-                .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(detail_widget, area);
 }
@@ -2222,7 +2266,7 @@ fn draw_summary_skipped(
     lines.push(Line::from(vec![
         Span::styled(
             format!("🛡️  {total_skipped} symbols skipped"),
-            Style::default().fg(ctp(MOCHA.text)).add_modifier(Modifier::BOLD),
+            Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled("(graphql, orm, derive(Builder))", dim),
@@ -2246,17 +2290,17 @@ fn draw_summary_skipped(
 
         let name_style = if is_focused {
             Style::default()
-                .fg(ctp(MOCHA.sapphire))
+                .fg(ctp(flavor().sapphire))
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default()
-                .fg(ctp(MOCHA.sapphire))
+                .fg(ctp(flavor().sapphire))
                 .add_modifier(Modifier::BOLD)
         };
 
         lines.push(Line::from(vec![
-            Span::styled(cursor_indicator, Style::default().fg(ctp(MOCHA.lavender))),
-            Span::styled(format!("{arrow} "), Style::default().fg(ctp(MOCHA.overlay1))),
+            Span::styled(cursor_indicator, Style::default().fg(ctp(flavor().lavender))),
+            Span::styled(format!("{arrow} "), Style::default().fg(ctp(flavor().overlay1))),
             Span::styled(&result.crate_name, name_style),
             Span::raw(" "),
             Span::styled(
@@ -2268,12 +2312,12 @@ fn draw_summary_skipped(
         if is_expanded {
             for (name, reason) in &result.skipped {
                 let reason_label = match reason {
-                    SkipReason::Graphql => Span::styled(" [graphql]", Style::default().fg(ctp(MOCHA.mauve))),
-                    SkipReason::Orm => Span::styled(" [orm]", Style::default().fg(ctp(MOCHA.teal))),
+                    SkipReason::Graphql => Span::styled(" [graphql]", Style::default().fg(ctp(flavor().mauve))),
+                    SkipReason::Orm => Span::styled(" [orm]", Style::default().fg(ctp(flavor().teal))),
                 };
                 lines.push(Line::from(vec![
                     Span::raw("      "),
-                    Span::styled(name.as_str(), Style::default().fg(ctp(MOCHA.subtext0))),
+                    Span::styled(name.as_str(), Style::default().fg(ctp(flavor().subtext0))),
                     reason_label,
                 ]));
             }
@@ -2290,9 +2334,9 @@ fn draw_summary_skipped(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(title.to_string())
-                .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+                .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
         );
     frame.render_widget(widget, area);
 }
@@ -2306,8 +2350,8 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .file
         .strip_prefix(&app.workspace_root)
         .unwrap_or(&item.symbol.file);
-    let dim = Style::default().fg(ctp(MOCHA.overlay0));
-    let label_style = Style::default().fg(ctp(MOCHA.peach));
+    let dim = Style::default().fg(ctp(flavor().overlay0));
+    let label_style = Style::default().fg(ctp(flavor().peach));
 
     let is_definition_only = matches!(
         &app.git_states[app.current],
@@ -2337,24 +2381,24 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
 
     // -- Symbol info (top-left) --
     let kind_label = match item.kind {
-        SymbolKind::UnusedAnywhere => Span::styled("❗ unused everywhere", Style::default().fg(ctp(MOCHA.red))),
+        SymbolKind::UnusedAnywhere => Span::styled("❗ unused everywhere", Style::default().fg(ctp(flavor().red))),
         SymbolKind::CrateInternalOnly { refs } => Span::styled(
             format!("🔧 crate-internal only ({refs} refs)"),
-            Style::default().fg(ctp(MOCHA.yellow)),
+            Style::default().fg(ctp(flavor().yellow)),
         ),
     };
     let symbol_text = Text::from(vec![
         Line::from(vec![
             Span::styled(
                 &item.symbol.name,
-                Style::default().fg(ctp(MOCHA.text)).add_modifier(Modifier::BOLD),
+                Style::default().fg(ctp(flavor().text)).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             kind_label,
         ]),
         Line::from(Span::styled(
             format!("{}:{}", rel_path.display(), item.symbol.line),
-            Style::default().fg(ctp(MOCHA.subtext0)),
+            Style::default().fg(ctp(flavor().subtext0)),
         )),
     ]);
     let review_title = if is_definition_only {
@@ -2363,16 +2407,16 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         format!(" 🔍 Review ({}/{}) ", app.current + 1, total)
     };
     let symbol_border_style = if is_definition_only {
-        Style::default().fg(ctp(MOCHA.green))
+        Style::default().fg(ctp(flavor().green))
     } else {
-        Style::default().fg(ctp(MOCHA.surface2))
+        Style::default().fg(ctp(flavor().surface2))
     };
     let symbol_block = Paragraph::new(symbol_text).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(symbol_border_style)
             .title(review_title)
-            .title_style(Style::default().fg(ctp(MOCHA.lavender)).add_modifier(Modifier::BOLD)),
+            .title_style(Style::default().fg(ctp(flavor().lavender)).add_modifier(Modifier::BOLD)),
     );
     frame.render_widget(symbol_block, left_rows[0]);
 
@@ -2399,7 +2443,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
             if let Some(blame) = &info.blame {
                 lines.push(Line::from(vec![
                     Span::styled("📝 Line last modified ", label_style),
-                    Span::styled(&blame.age, Style::default().fg(ctp(MOCHA.mauve))),
+                    Span::styled(&blame.age, Style::default().fg(ctp(flavor().mauve))),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -2409,9 +2453,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(&blame.short_hash, Style::default().fg(ctp(MOCHA.sapphire))),
+                    Span::styled(&blame.short_hash, Style::default().fg(ctp(flavor().sapphire))),
                     Span::raw(" "),
-                    Span::styled(&blame.summary, Style::default().fg(ctp(MOCHA.text))),
+                    Span::styled(&blame.summary, Style::default().fg(ctp(flavor().text))),
                 ]));
                 lines.push(Line::from(Span::styled(
                     format!("  $ git show {}", blame.short_hash),
@@ -2425,7 +2469,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 }
                 lines.push(Line::from(vec![
                     Span::styled("🔎 Symbol last added/removed ", label_style),
-                    Span::styled(&entry.age, Style::default().fg(ctp(MOCHA.mauve))),
+                    Span::styled(&entry.age, Style::default().fg(ctp(flavor().mauve))),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -2435,9 +2479,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(&entry.short_hash, Style::default().fg(ctp(MOCHA.sapphire))),
+                    Span::styled(&entry.short_hash, Style::default().fg(ctp(flavor().sapphire))),
                     Span::raw(" "),
-                    Span::styled(&entry.subject, Style::default().fg(ctp(MOCHA.text))),
+                    Span::styled(&entry.subject, Style::default().fg(ctp(flavor().text))),
                 ]));
                 lines.push(Line::from(Span::styled(
                     format!("  $ git show {}", entry.short_hash),
@@ -2459,9 +2503,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(" 🕰️  Git context ")
-                .title_style(Style::default().fg(ctp(MOCHA.peach))),
+                .title_style(Style::default().fg(ctp(flavor().peach))),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(git_block, left_rows[1]);
@@ -2480,9 +2524,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
                 )));
                 for m in &entry.diff_matches {
                     let style = if m.starts_with('+') {
-                        Style::default().fg(ctp(MOCHA.green))
+                        Style::default().fg(ctp(flavor().green))
                     } else {
-                        Style::default().fg(ctp(MOCHA.red))
+                        Style::default().fg(ctp(flavor().red))
                     };
                     patch_lines.push(Line::from(Span::styled(m.as_str(), style)));
                 }
@@ -2490,13 +2534,13 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
             }
             for patch_line in entry.patch.lines().skip(app.scroll_offset as usize) {
                 let style = if patch_line.starts_with('+') && !patch_line.starts_with("+++") {
-                    Style::default().fg(ctp(MOCHA.green))
+                    Style::default().fg(ctp(flavor().green))
                 } else if patch_line.starts_with('-') && !patch_line.starts_with("---") {
-                    Style::default().fg(ctp(MOCHA.red))
+                    Style::default().fg(ctp(flavor().red))
                 } else if patch_line.starts_with("@@") {
-                    Style::default().fg(ctp(MOCHA.sky))
+                    Style::default().fg(ctp(flavor().sky))
                 } else {
-                    Style::default().fg(ctp(MOCHA.overlay0))
+                    Style::default().fg(ctp(flavor().overlay0))
                 };
                 patch_lines.push(Line::from(Span::styled(patch_line, style)));
             }
@@ -2516,9 +2560,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(patch_title)
-                .title_style(Style::default().fg(ctp(MOCHA.peach))),
+                .title_style(Style::default().fg(ctp(flavor().peach))),
         );
     frame.render_widget(patch_block, cols[1]);
 
@@ -2541,11 +2585,11 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .map(|(i, label)| {
             let style = if i == app.selected_action {
                 Style::default()
-                    .fg(ctp(MOCHA.base))
-                    .bg(ctp(MOCHA.lavender))
+                    .fg(ctp(flavor().base))
+                    .bg(ctp(flavor().lavender))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(ctp(MOCHA.text))
+                Style::default().fg(ctp(flavor().text))
             };
             ListItem::new(*label).style(style)
         })
@@ -2555,9 +2599,9 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ctp(MOCHA.surface2)))
+                .border_style(Style::default().fg(ctp(flavor().surface2)))
                 .title(" ⚡ Action (f/a/s or ↑↓+Enter, j/k scroll, q quit) ")
-                .title_style(Style::default().fg(ctp(MOCHA.peach))),
+                .title_style(Style::default().fg(ctp(flavor().peach))),
         )
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(action_list, rows[1], &mut list_state);
@@ -2570,6 +2614,8 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    FLAVOR.set(args.palette.flavor_colors()).expect("palette already set");
+    PALETTE_NAME.set(args.palette.name()).expect("palette name already set");
     let start = Instant::now();
 
     // Find workspace root (look for root Cargo.toml with [workspace])
