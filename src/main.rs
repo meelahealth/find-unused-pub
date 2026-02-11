@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, OnceLock};
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -259,7 +260,7 @@ trait SymbolFilter: Send + Sync {
     /// Partition `symbols` into (kept, skipped).
     /// Called once per crate after `collect_pub_symbols`.
     /// Default: keep everything.
-    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(String, SkipReason)>) {
+    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(PubSymbol, SkipReason)>) {
         (symbols, vec![])
     }
 
@@ -283,19 +284,19 @@ impl SymbolFilter for OrmFilter {
         flavor().teal
     }
 
-    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(String, SkipReason)>) {
+    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(PubSymbol, SkipReason)>) {
         let mut kept = vec![];
         let mut skipped = vec![];
         for sym in symbols {
             if SKIP_SYMBOLS.contains(&sym.name.as_str()) {
-                skipped.push((sym.name, SkipReason::Orm));
+                skipped.push((sym, SkipReason::Orm));
             } else {
                 kept.push(sym);
             }
         }
         // Deduplicate skipped names
         let mut seen = HashSet::new();
-        skipped.retain(|(name, _)| seen.insert(name.clone()));
+        skipped.retain(|(sym, _)| seen.insert(sym.name.clone()));
         (kept, skipped)
     }
 }
@@ -312,7 +313,7 @@ impl SymbolFilter for GraphqlFilter {
         flavor().mauve
     }
 
-    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(String, SkipReason)>) {
+    fn filter(&self, symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(PubSymbol, SkipReason)>) {
         filter_graphql_exempt(symbols)
     }
 }
@@ -357,7 +358,7 @@ struct CrateResult {
     items_found: usize,
     unused: Vec<UnusedSymbol>,
     /// Symbols skipped with the reason they were skipped.
-    skipped: Vec<(String, SkipReason)>,
+    skipped: Vec<(PubSymbol, SkipReason)>,
 }
 
 enum ScanMessage {
@@ -909,7 +910,7 @@ fn analyze_crate(
 
     // Run each active filter plugin in sequence
     let mut symbols = all_symbols;
-    let mut skipped: Vec<(String, SkipReason)> = vec![];
+    let mut skipped: Vec<(PubSymbol, SkipReason)> = vec![];
     for filter in filters.iter() {
         on_progress(&format!("filtering [{}]…", filter.name()));
         let (kept, filter_skipped) = filter.filter(symbols);
@@ -1265,7 +1266,7 @@ fn node_has_graphql_attr(node: tree_sitter::Node, source: &str) -> Option<&'stat
 
 /// Filter out symbols that are exempt due to async-graphql attributes.
 /// Returns (kept symbols, names of skipped symbols).
-fn filter_graphql_exempt(symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(String, SkipReason)>) {
+fn filter_graphql_exempt(symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(PubSymbol, SkipReason)>) {
     let mut kept = vec![];
     let mut skipped = vec![];
     for sym in symbols {
@@ -1277,7 +1278,7 @@ fn filter_graphql_exempt(symbols: Vec<PubSymbol>) -> (Vec<PubSymbol>, Vec<(Strin
             }
         };
         if let Some(attr) = is_graphql_exempt(&source, sym.line - 1) {
-            skipped.push((sym.name, SkipReason::Graphql(attr)));
+            skipped.push((sym, SkipReason::Graphql(attr)));
         } else {
             kept.push(sym);
         }
@@ -2575,11 +2576,20 @@ fn draw_summary_skipped(
         ]));
 
         if is_expanded {
-            for (name, reason) in &result.skipped {
+            for (sym, reason) in &result.skipped {
+                let rel = sym
+                    .file
+                    .strip_prefix(&app.workspace_root)
+                    .unwrap_or(&sym.file);
                 lines.push(Line::from(vec![
                     Span::raw("      "),
-                    Span::styled(name.as_str(), Style::default().fg(ctp(flavor().subtext0))),
+                    Span::styled(&sym.name, Style::default().fg(ctp(flavor().subtext0))),
                     Span::styled(reason.label(), Style::default().fg(reason.label_color())),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{}:{}", rel.display(), sym.line),
+                        Style::default().fg(ctp(flavor().overlay0)),
+                    ),
                 ]));
             }
         }
@@ -3032,6 +3042,56 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Non-interactive pipe output: when stdout is not a TTY, print plain text
+    if !std::io::stdout().is_terminal() {
+        let mut handles = vec![];
+        for crate_path in &target_crates {
+            let crate_path = crate_path.clone();
+            let all_dirs = all_crate_dirs.clone();
+            let wl = whitelist.clone();
+            let f = filters.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                analyze_crate(&crate_path, &all_dirs, &wl, &f, &|_| {})
+            }));
+        }
+        let mut results = vec![];
+        for handle in handles {
+            results.push(handle.await??);
+        }
+        let elapsed = start.elapsed();
+
+        let total_unused: usize = results.iter().map(|r| r.unused.len()).sum();
+        let total_skipped: usize = results.iter().map(|r| r.skipped.len()).sum();
+        let total_items: usize = results.iter().map(|r| r.items_found).sum();
+        println!("find-unused-pub  ({:.1}s)  {} items scanned, {} unused, {} skipped",
+            elapsed.as_secs_f64(), total_items, total_unused, total_skipped);
+        println!();
+
+        for result in &results {
+            if result.unused.is_empty() && result.skipped.is_empty() {
+                continue;
+            }
+            println!("# {}", result.crate_name);
+            for item in &result.unused {
+                let rel = item.symbol.file.strip_prefix(&workspace_root).unwrap_or(&item.symbol.file);
+                let kind = match item.kind {
+                    SymbolKind::UnusedAnywhere => "unused",
+                    SymbolKind::CrateInternalOnly { refs } => {
+                        // Leak a formatted string — acceptable for one-shot CLI output
+                        Box::leak(format!("crate-internal ({refs} refs)").into_boxed_str())
+                    }
+                };
+                println!("  {} {}:{} [{}]", item.symbol.name, rel.display(), item.symbol.line, kind);
+            }
+            for (sym, reason) in &result.skipped {
+                let rel = sym.file.strip_prefix(&workspace_root).unwrap_or(&sym.file);
+                println!("  {} {}:{} {}", sym.name, rel.display(), sym.line, reason.label());
+            }
+            println!();
+        }
+        return Ok(());
+    }
+
     // Streaming TUI: start immediately, show scan progress
     let crate_names: Vec<String> = target_crates
         .iter()
@@ -3251,8 +3311,8 @@ pub fn other() {}
         assert!(!kept_names.contains(&"Model"));
         assert!(!kept_names.contains(&"Entity"));
         assert!(kept_names.contains(&"real_thing"));
-        assert!(skipped.iter().any(|(n, r)| n == "Model" && *r == SkipReason::Orm));
-        assert!(skipped.iter().any(|(n, r)| n == "Entity" && *r == SkipReason::Orm));
+        assert!(skipped.iter().any(|(sym, r)| sym.name == "Model" && *r == SkipReason::Orm));
+        assert!(skipped.iter().any(|(sym, r)| sym.name == "Entity" && *r == SkipReason::Orm));
     }
 
     // -- count_symbol_hits ---------------------------------------------------
@@ -3522,7 +3582,7 @@ impl MyMutation {
         let kept_names: Vec<&str> = kept.iter().map(|s| s.name.as_str()).collect();
         assert!(kept_names.contains(&"regular_fn"));
         assert!(!kept_names.contains(&"GqlOutput"));
-        assert!(skipped.iter().any(|(name, reason)| name == "GqlOutput" && *reason == SkipReason::Graphql("SimpleObject")));
+        assert!(skipped.iter().any(|(sym, reason)| sym.name == "GqlOutput" && *reason == SkipReason::Graphql("SimpleObject")));
     }
 
     // -- derive_builder aliases ----------------------------------------------
@@ -3690,7 +3750,7 @@ pub struct Plain {
         )
         .unwrap();
         // GqlOutput should NOT be in skipped (graphql filter is off)
-        assert!(!result.skipped.iter().any(|(n, _)| n == "GqlOutput"));
+        assert!(!result.skipped.iter().any(|(sym, _)| sym.name == "GqlOutput"));
         // GqlOutput should be in unused
         assert!(result.unused.iter().any(|u| u.symbol.name == "GqlOutput"));
     }
@@ -3713,7 +3773,7 @@ pub struct Plain {
             &|_| {},
         )
         .unwrap();
-        assert!(!result.skipped.iter().any(|(n, _)| n == "Model"));
+        assert!(!result.skipped.iter().any(|(sym, _)| sym.name == "Model"));
         assert!(result.unused.iter().any(|u| u.symbol.name == "Model"));
         assert!(result.unused.iter().any(|u| u.symbol.name == "Entity"));
     }
