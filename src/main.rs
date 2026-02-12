@@ -317,8 +317,54 @@ fn theme() -> &'static ThemeColors {
     &themes[idx.min(themes.len() - 1)]
 }
 
-/// Pick two maximally contrasting colors from the theme swatch and a blended midpoint.
-fn eq_colors() -> (Color, Color, Color) {
+// ── HSL helpers ─────────────────────────────────────────────────────────
+
+fn rgb_to_hsl(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < 1e-6 {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let h = if (max - r).abs() < 1e-6 {
+        ((g - b) / d + if g < b { 6.0 } else { 0.0 }) / 6.0
+    } else if (max - g).abs() < 1e-6 {
+        ((b - r) / d + 2.0) / 6.0
+    } else {
+        ((r - g) / d + 4.0) / 6.0
+    };
+    (h, s, l)
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
+    if s.abs() < 1e-6 {
+        let v = (l * 255.0).round() as u8;
+        return (v, v, v);
+    }
+    let hue2rgb = |p: f64, q: f64, mut t: f64| -> f64 {
+        if t < 0.0 { t += 1.0; }
+        if t > 1.0 { t -= 1.0; }
+        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
+        if t < 0.5 { return q; }
+        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+        p
+    };
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let r = hue2rgb(p, q, h + 1.0 / 3.0);
+    let g = hue2rgb(p, q, h);
+    let b = hue2rgb(p, q, h - 1.0 / 3.0);
+    ((r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8)
+}
+
+/// Ticks between snapping to a new color pair (~8 s at 15 fps).
+const EQ_PAIR_INTERVAL: u16 = 120;
+
+/// Pick two distant colors from the theme swatch (cycling the pair over time)
+/// and a triadic blend. The pair snaps discretely — no per-frame color drift.
+fn eq_colors(tick: u16) -> (Color, Color, Color) {
     let t = theme();
     let candidates = &t.swatch;
 
@@ -337,24 +383,39 @@ fn eq_colors() -> (Color, Color, Color) {
         dr * dr + dg * dg + db * db
     }
 
-    let mut best = (0usize, 1usize, 0i64);
+    // Build list of pairs sorted by distance (descending).
+    let mut pairs: Vec<(usize, usize, i64)> = Vec::new();
     for i in 0..candidates.len() {
         for j in (i + 1)..candidates.len() {
-            let d = dist_sq(&candidates[i], &candidates[j]);
-            if d > best.2 {
-                best = (i, j, d);
-            }
+            pairs.push((i, j, dist_sq(&candidates[i], &candidates[j])));
         }
     }
-    let a = candidates[best.0];
-    let b = candidates[best.1];
+    pairs.sort_by(|a, b| b.2.cmp(&a.2));
+
+    // Keep the top half — all sufficiently distant.
+    let keep = (pairs.len() / 2).max(1);
+    let pairs = &pairs[..keep];
+
+    // Snap to a new pair every EQ_PAIR_INTERVAL ticks.
+    let idx = (tick / EQ_PAIR_INTERVAL) as usize % pairs.len();
+    let (ai, bi, _) = pairs[idx];
+    let a = candidates[ai];
+    let b = candidates[bi];
+
+    // Triadic harmony: midpoint hue rotated 120° for the blend.
     let (ar, ag, ab) = rgb(&a);
     let (br, bg, bb) = rgb(&b);
-    let blend = Color::Rgb(
-        ((ar + br) / 2) as u8,
-        ((ag + bg) / 2) as u8,
-        ((ab + bb) / 2) as u8,
-    );
+    let (h1, s1, l1) = rgb_to_hsl(ar as f64 / 255.0, ag as f64 / 255.0, ab as f64 / 255.0);
+    let (h2, s2, l2) = rgb_to_hsl(br as f64 / 255.0, bg as f64 / 255.0, bb as f64 / 255.0);
+    let mut dh = h2 - h1;
+    if dh > 0.5 { dh -= 1.0; }
+    if dh < -0.5 { dh += 1.0; }
+    let mid_h = (h1 + dh / 2.0 + 1.0) % 1.0;
+    let tri_h = (mid_h + 1.0 / 3.0) % 1.0;
+    let tri_s = (s1.max(s2) * 0.9).max(0.4);
+    let tri_l = ((l1 + l2) / 2.0).clamp(0.3, 0.7);
+    let (tr, tg, tb) = hsl_to_rgb(tri_h, tri_s, tri_l);
+    let blend = Color::Rgb(tr, tg, tb);
     (a, b, blend)
 }
 
@@ -487,7 +548,7 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
     let n = if style.chars.is_empty() { w * 2 } else { w };
     let raw_a = eq_wave_samples(tick, n, 0);
     let raw_b = eq_wave_samples(tick, n, 1);
-    let (color_a, color_b, color_both) = eq_colors();
+    let (color_a, color_b, color_both) = eq_colors(tick);
 
     if style.chars.is_empty() {
         // ── Braille mode ──────────────────────────────────────────────
