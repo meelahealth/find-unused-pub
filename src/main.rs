@@ -51,6 +51,19 @@ struct EqCharset {
     chars: &'static [char],
 }
 
+/// Easter egg symbols that occasionally replace normal wave characters (~0.5% chance).
+const EQ_EGGS: &[char] = &[
+    '♔', '♕', '♖', '♗', '♘', '♙',               // chess
+    '☀', '☁', '☂', '☃', '☄',                     // weather
+    '☮', '☯', '♠', '♣', '♥', '♦',                // misc symbols
+    '‽',                                            // interrobang
+    '۞',                                            // rub el hizb
+    'ༀ',                                            // tibetan a
+    '★', '☆', '⚡', '⚓', '⚔', '⚛', '⚜',         // more misc
+    '✦', '✧', '✶', '✹', '✺',                     // dingbats
+];
+
+
 const EQ_STYLES: [EqCharset; 4] = [
     // 0: Braille (rendered specially, chars unused)
     EqCharset { name: "braille", chars: &[] },
@@ -94,6 +107,19 @@ struct ThemeColors {
 /// Convert a catppuccin color to ratatui Color.
 fn ctp(c: catppuccin::Color) -> Color {
     c.into()
+}
+
+/// Linearly interpolate between two RGB colors. Falls back to `a` for non-RGB.
+fn lerp_color(a: Color, b: Color, t: f64) -> Color {
+    match (a, b) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let mix = |c1: u8, c2: u8| -> u8 {
+                (c1 as f64 + (c2 as f64 - c1 as f64) * t).round() as u8
+            };
+            Color::Rgb(mix(r1, r2), mix(g1, g2), mix(b1, b2))
+        }
+        _ => a,
+    }
 }
 
 fn theme_from_catppuccin(name: &'static str, f: &catppuccin::FlavorColors) -> ThemeColors {
@@ -551,6 +577,25 @@ fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
                     // above this cell (the bar fills downward to the bottom).
                     let in_a = if is_bars { la <= cell_bot } else { la >= cell_top && la <= cell_bot };
                     let in_b = if is_bars { lb <= cell_bot } else { lb >= cell_top && lb <= cell_bot };
+
+                    // Easter egg: ~0.5% chance per column to spawn a symbol that
+                    // stays put for ~0.6s, fading toward the background.
+                    let egg_life: u32 = 5;
+                    let egg_epoch = tick as u32 / egg_life;
+                    let egg_age = tick as u32 % egg_life;
+                    let egg_seed = egg_epoch * 7919 + col as u32 * 1013;
+                    if style.name == "dots" && eq_noise(egg_seed) > 0.995 {
+                        let idx = (eq_noise(egg_seed.wrapping_mul(2903)) * 1000.0) as usize;
+                        let spawn_level = (eq_noise(egg_seed.wrapping_mul(4517)) * max_level as f64) as usize;
+                        let egg_row = spawn_level / levels;
+                        if cell_row == egg_row {
+                            let ch = EQ_EGGS[idx % EQ_EGGS.len()];
+                            let start = if in_a || in_b { color_both } else { color_a };
+                            let t = egg_age as f64 / egg_life as f64;
+                            let fg = lerp_color(start, theme().surface, t);
+                            return Span::styled(String::from(ch), Style::default().fg(fg));
+                        }
+                    }
 
                     if !in_a && !in_b {
                         return Span::raw(" ");
