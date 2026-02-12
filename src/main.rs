@@ -33,6 +33,8 @@ use rusqlite::Connection;
 
 /// Palette index: cycles through all available themes.
 static PALETTE_IDX: AtomicU8 = AtomicU8::new(3);
+/// EQ visualizer style index.
+static EQ_STYLE_IDX: AtomicU8 = AtomicU8::new(0);
 static THEMES: OnceLock<Vec<ThemeColors>> = OnceLock::new();
 static ACTIVE_FILTER_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
 static DISABLED_FILTER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
@@ -40,6 +42,25 @@ static ENABLED_FILTER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 static IGNORED_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 
 const PALETTE_COUNT: u8 = 8;
+const EQ_STYLE_COUNT: u8 = 4;
+
+/// Character sets for wave rendering.  Each maps a vertical position (0=top..N=bottom)
+/// to a display character.  The `height` field is how many distinct levels the charset has.
+struct EqCharset {
+    name: &'static str,
+    chars: &'static [char],
+}
+
+const EQ_STYLES: [EqCharset; 4] = [
+    // 0: Braille (rendered specially, chars unused)
+    EqCharset { name: "braille", chars: &[] },
+    // 1: Scan lines — ⎺⎻─⎼⎽
+    EqCharset { name: "scanline", chars: &['\u{23BA}', '\u{23BB}', '\u{2500}', '\u{23BC}', '\u{23BD}'] },
+    // 2: Dots — ˙ॱ⋅.˳  (from ⋅.˳˳.⋅ॱ˙˙ॱ⋅.˳˳.⋅)
+    EqCharset { name: "dots", chars: &['\u{02D9}', '\u{0971}', '\u{22C5}', '.', '\u{02F3}'] },
+    // 3: Bars — ▁▂▃▄▅▆▇█ (block elements, 8 levels)
+    EqCharset { name: "bars", chars: &['\u{2588}', '\u{2587}', '\u{2586}', '\u{2585}', '\u{2584}', '\u{2583}', '\u{2582}', '\u{2581}'] },
+];
 
 #[derive(Debug)]
 struct ThemeColors {
@@ -431,53 +452,132 @@ fn eq_wave_b(x: f64, tick: u16) -> f64 {
 
 /// Multi-row dual-wave braille visualizer (oscilloscope style).
 /// Two waveforms rendered in contrasting colors; where they overlap the accent color is used.
+/// Supports multiple visual styles selectable via `v` key.
 fn eq_widget<'a>(tick: u16, width: u16, height: u16) -> Text<'a> {
-    const DOT: [[u32; 2]; 4] = [
-        [0x01, 0x08],
-        [0x02, 0x10],
-        [0x04, 0x20],
-        [0x40, 0x80],
-    ];
+    let style = eq_style();
+    let w = width as usize;
 
-    let total_rows = (height as usize) * 4;
-    let max_row = total_rows.saturating_sub(1);
-    let to_row = |v: f64| -> usize {
-        (v * max_row as f64).round().clamp(0.0, max_row as f64) as usize
-    };
-
-    // Pre-compute both waves in batch (2 horizontal samples per cell column).
-    let n = (width as usize) * 2;
+    // One sample per column for character-based styles, two for braille.
+    let n = if style.chars.is_empty() { w * 2 } else { w };
     let raw_a = eq_wave_samples(tick, n, 0);
     let raw_b = eq_wave_samples(tick, n, 1);
-    let samples_a: Vec<usize> = raw_a.iter().map(|&v| to_row(v)).collect();
-    let samples_b: Vec<usize> = raw_b.iter().map(|&v| to_row(v)).collect();
-
     let (color_a, color_b, color_both) = eq_colors();
+
+    if style.chars.is_empty() {
+        // ── Braille mode ──────────────────────────────────────────────
+        const DOT: [[u32; 2]; 4] = [
+            [0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80],
+        ];
+        let total_rows = (height as usize) * 4;
+        let max_row = total_rows.saturating_sub(1);
+        let to_row = |v: f64| -> usize {
+            (v * max_row as f64).round().clamp(0.0, max_row as f64) as usize
+        };
+        let samples_a: Vec<usize> = raw_a.iter().map(|&v| to_row(v)).collect();
+        let samples_b: Vec<usize> = raw_b.iter().map(|&v| to_row(v)).collect();
+
+        let lines: Vec<Line<'a>> = (0..height as usize)
+            .map(|cell_row| {
+                let spans: Vec<Span<'a>> = (0..w)
+                    .map(|col| {
+                        let mut bits_a = 0u32;
+                        let mut bits_b = 0u32;
+                        let cell_top = cell_row * 4;
+                        for dot_row in 0..4usize {
+                            let global_row = cell_top + dot_row;
+                            if samples_a[col * 2] == global_row { bits_a |= DOT[dot_row][0]; }
+                            if samples_a[col * 2 + 1] == global_row { bits_a |= DOT[dot_row][1]; }
+                            if samples_b[col * 2] == global_row { bits_b |= DOT[dot_row][0]; }
+                            if samples_b[col * 2 + 1] == global_row { bits_b |= DOT[dot_row][1]; }
+                        }
+                        let bits = 0x2800u32 | bits_a | bits_b;
+                        let has_a = bits_a != 0;
+                        let has_b = bits_b != 0;
+                        let fg = match (has_a, has_b) {
+                            (true, true) => color_both,
+                            (true, false) => color_a,
+                            (false, true) => color_b,
+                            (false, false) => color_a,
+                        };
+                        let ch = char::from_u32(bits).unwrap_or(' ');
+                        Span::styled(String::from(ch), Style::default().fg(fg))
+                    })
+                    .collect();
+                Line::from(spans)
+            })
+            .collect();
+        return Text::from(lines);
+    }
+
+    // ── Character-based modes (scanline / dots / bars) ─────────────────
+    // Map wave values (0.0–1.0) to character-level rows within cells.
+    let levels = style.chars.len();
+    let total_levels = (height as usize) * levels;
+    let max_level = total_levels.saturating_sub(1);
+    let to_level = |v: f64| -> usize {
+        (v * max_level as f64).round().clamp(0.0, max_level as f64) as usize
+    };
+    let is_bars = style.name == "bars";
+
+    // For bars, convert wave position to amplitude (distance from center),
+    // so bars always grow upward from the bottom like a spectrum analyzer.
+    let (levels_a, levels_b): (Vec<usize>, Vec<usize>) = if is_bars {
+        let to_bar_top = |v: f64| -> usize {
+            let amp = (v - 0.5).abs() * 2.0 * 0.85;
+            let top = max_level as f64 * (1.0 - amp);
+            top.round().clamp(0.0, max_level as f64) as usize
+        };
+        (
+            raw_a.iter().map(|&v| to_bar_top(v)).collect(),
+            raw_b.iter().map(|&v| to_bar_top(v)).collect(),
+        )
+    } else {
+        (
+            raw_a.iter().map(|&v| to_level(v)).collect(),
+            raw_b.iter().map(|&v| to_level(v)).collect(),
+        )
+    };
 
     let lines: Vec<Line<'a>> = (0..height as usize)
         .map(|cell_row| {
-            let spans: Vec<Span<'a>> = (0..width as usize)
+            let spans: Vec<Span<'a>> = (0..w)
                 .map(|col| {
-                    let mut bits_a = 0u32;
-                    let mut bits_b = 0u32;
-                    let cell_top = cell_row * 4;
-                    for dot_row in 0..4usize {
-                        let global_row = cell_top + dot_row;
-                        if samples_a[col * 2] == global_row { bits_a |= DOT[dot_row][0]; }
-                        if samples_a[col * 2 + 1] == global_row { bits_a |= DOT[dot_row][1]; }
-                        if samples_b[col * 2] == global_row { bits_b |= DOT[dot_row][0]; }
-                        if samples_b[col * 2 + 1] == global_row { bits_b |= DOT[dot_row][1]; }
+                    let cell_top = cell_row * levels;
+                    let cell_bot = cell_top + levels - 1;
+                    let la = levels_a[col];
+                    let lb = levels_b[col];
+
+                    // For bars, a column is active if the bar top is at or
+                    // above this cell (the bar fills downward to the bottom).
+                    let in_a = if is_bars { la <= cell_bot } else { la >= cell_top && la <= cell_bot };
+                    let in_b = if is_bars { lb <= cell_bot } else { lb >= cell_top && lb <= cell_bot };
+
+                    if !in_a && !in_b {
+                        return Span::raw(" ");
                     }
-                    let bits = 0x2800u32 | bits_a | bits_b;
-                    let has_a = bits_a != 0;
-                    let has_b = bits_b != 0;
-                    let fg = match (has_a, has_b) {
-                        (true, true) => color_both,
-                        (true, false) => color_a,
-                        (false, true) => color_b,
-                        (false, false) => color_a, // empty cell, doesn't matter
+
+                    // Pick the character and color for this cell.
+                    // If both waves are in this cell, show the blend color
+                    // and pick the character for whichever has more amplitude.
+                    let (level, fg) = match (in_a, in_b) {
+                        (true, true) => {
+                            // Lower level = taller bar = more amplitude
+                            if la <= lb { (la, color_both) } else { (lb, color_both) }
+                        }
+                        (true, false) => (la, color_a),
+                        (false, true) => (lb, color_b),
+                        _ => unreachable!(),
                     };
-                    let ch = char::from_u32(bits).unwrap_or(' ');
+
+                    // For bars: cells entirely below the bar top → full block.
+                    // The cell containing the bar top → partial block.
+                    let ch = if is_bars && level < cell_top {
+                        '\u{2588}'
+                    } else {
+                        let sub = level - cell_top;
+                        style.chars[sub.min(levels - 1)]
+                    };
+
                     Span::styled(String::from(ch), Style::default().fg(fg))
                 })
                 .collect();
@@ -536,6 +636,17 @@ fn cycle_palette() -> &'static str {
     let next = (PALETTE_IDX.load(Ordering::Relaxed) + 1) % PALETTE_COUNT;
     PALETTE_IDX.store(next, Ordering::Relaxed);
     theme().name
+}
+
+/// Cycle to the next EQ visualizer style and return its name.
+fn cycle_eq_style() -> &'static str {
+    let next = (EQ_STYLE_IDX.load(Ordering::Relaxed) + 1) % EQ_STYLE_COUNT;
+    EQ_STYLE_IDX.store(next, Ordering::Relaxed);
+    EQ_STYLES[next as usize].name
+}
+
+fn eq_style() -> &'static EqCharset {
+    &EQ_STYLES[EQ_STYLE_IDX.load(Ordering::Relaxed) as usize]
 }
 
 /// Get the list of active filter names for TUI display.
@@ -2377,6 +2488,9 @@ fn run_tui_main_loop(
                             KeyCode::Char('p') => {
                                 cycle_palette();
                             }
+                            KeyCode::Char('v') => {
+                                cycle_eq_style();
+                            }
                             _ => {}
                         }
                     }
@@ -2511,6 +2625,9 @@ fn run_tui_main_loop(
                             KeyCode::Char('p') => {
                                 cycle_palette();
                             }
+                            KeyCode::Char('v') => {
+                                cycle_eq_style();
+                            }
                             _ => {}
                         }
                     }
@@ -2602,6 +2719,9 @@ fn run_tui_main_loop(
                                 }
                                 KeyCode::Char('p') => {
                                     cycle_palette();
+                                }
+                                KeyCode::Char('v') => {
+                                    cycle_eq_style();
                                 }
                                 _ => {}
                             }
@@ -2927,6 +3047,8 @@ fn draw_scanning(frame: &mut ratatui::Frame, app: &App) {
     let bar = Paragraph::new(Line::from(vec![
         Span::styled(" p", Style::default().fg(theme().tertiary).add_modifier(Modifier::BOLD)),
         Span::styled(": palette  ", dim),
+        Span::styled("v", Style::default().fg(theme().tertiary).add_modifier(Modifier::BOLD)),
+        Span::styled(": eq style  ", dim),
         Span::styled("PgUp/PgDn", Style::default().fg(theme().tertiary).add_modifier(Modifier::BOLD)),
         Span::styled(": scroll  ", dim),
         Span::styled("q", Style::default().fg(theme().tertiary).add_modifier(Modifier::BOLD)),
@@ -3006,7 +3128,7 @@ fn draw_summary(frame: &mut ratatui::Frame, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme().outline))
-                .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, PgUp/PgDn: scroll, p: palette, q: quit) ")
+                .title(" ⚡ Actions (↑↓+Enter or hotkey, Tab: swap view, PgUp/PgDn: scroll, p: palette, v: eq style, q: quit) ")
                 .title_style(Style::default().fg(theme().tertiary))
                 .title(ferris_line(app.crab_tick))
                 .title_bottom(palette_swatch()),
@@ -3632,7 +3754,7 @@ fn draw_review(frame: &mut ratatui::Frame, app: &ReviewApp, crab_tick: u16) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme().outline))
-                .title(" ⚡ Action (f/a/s or ↑↓+Enter, PgUp/PgDn: scroll, p: palette, q: quit) ")
+                .title(" ⚡ Action (f/a/s or ↑↓+Enter, PgUp/PgDn: scroll, p: palette, v: eq style, q: quit) ")
                 .title_style(Style::default().fg(theme().tertiary))
                 .title(ferris_line(crab_tick))
                 .title_bottom(palette_swatch()),
